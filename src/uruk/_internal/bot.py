@@ -7,13 +7,12 @@ import contextlib
 import html
 import itertools
 import logging
-import re
 import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -24,17 +23,17 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegramify_markdown import telegramify
+from telegramify_markdown.content import ContentType, File, Photo, Text
 
 from uruk._internal.agent import AgentTask, summarize_tool_input
 from uruk._internal.config import Config, ConfigError
-from uruk._internal.md import md_to_html
 from uruk._internal.store import SessionStore, TaskInfo
 
 logger = logging.getLogger(__name__)
 
 MESSAGE_LIMIT = 4000  # Telegram caps messages at 4096 chars; keep headroom.
-
-_FENCE_LINE = re.compile(r"^\s*```.*$", re.MULTILINE)
+MIN_FILE_LINES = 30  # Code blocks longer than this become file attachments.
 
 
 def chunk(text: str, limit: int = MESSAGE_LIMIT) -> Iterator[str]:
@@ -50,19 +49,19 @@ def chunk(text: str, limit: int = MESSAGE_LIMIT) -> Iterator[str]:
         yield text
 
 
-def chunk_markdown(text: str, limit: int = MESSAGE_LIMIT) -> Iterator[str]:
-    """Chunk markdown, closing and reopening code fences split across chunks."""
-    reopen = ""
-    for part in chunk(text, limit):
-        if reopen:
-            part = f"{reopen}\n{part}"
-        fences = _FENCE_LINE.findall(part)
-        if len(fences) % 2:  # The last fence is an unclosed opener.
-            reopen = fences[-1].strip()
-            part += "\n```"
-        else:
-            reopen = ""
-        yield part
+def to_entities(entities: list) -> list[MessageEntity] | None:
+    """Convert telegramify-markdown entities to python-telegram-bot ones."""
+    return [
+        MessageEntity(
+            type=entity.type,
+            offset=entity.offset,
+            length=entity.length,
+            url=entity.url,
+            language=entity.language,
+            custom_emoji_id=entity.custom_emoji_id,
+        )
+        for entity in entities
+    ] or None
 
 
 @dataclass
@@ -148,18 +147,46 @@ class UrukBot:
     # -- UI protocol (called from AgentTask) --------------------------------------
 
     async def send_text(self, topic_id: int, text: str) -> None:
-        for part in chunk_markdown(text):
-            try:
-                await self.app.bot.send_message(
-                    chat_id=self.config.chat_id,
-                    text=md_to_html(part),
-                    message_thread_id=topic_id,
-                    parse_mode=ParseMode.HTML,
-                )
-            except TelegramError:
-                # Telegram rejected our HTML (or the send failed); fall back to plain text.
-                logger.warning("HTML send failed for topic %s, retrying as plain text", topic_id)
+        try:
+            boxes = await telegramify(text, max_message_length=MESSAGE_LIMIT, min_file_lines=MIN_FILE_LINES)
+        except Exception:
+            logger.warning("telegramify failed for topic %s, sending plain text", topic_id, exc_info=True)
+            for part in chunk(text):
                 await self._send(topic_id, part)
+            return
+        for box in boxes:
+            try:
+                await self._send_box(topic_id, box)
+            except TelegramError:
+                logger.warning("sending %s to topic %s failed", type(box).__name__, topic_id, exc_info=True)
+                if isinstance(box, Text):
+                    await self._send(topic_id, box.text)
+
+    async def _send_box(self, topic_id: int, box: Text | File | Photo) -> None:
+        if box.content_type == ContentType.TEXT:
+            await self.app.bot.send_message(
+                chat_id=self.config.chat_id,
+                text=box.text,
+                entities=to_entities(box.entities),
+                message_thread_id=topic_id,
+            )
+        elif box.content_type == ContentType.FILE:
+            await self.app.bot.send_document(
+                chat_id=self.config.chat_id,
+                document=box.file_data,
+                filename=box.file_name,
+                caption=box.caption_text or None,
+                caption_entities=to_entities(box.caption_entities),
+                message_thread_id=topic_id,
+            )
+        else:  # ContentType.PHOTO (e.g. rendered mermaid diagrams)
+            await self.app.bot.send_photo(
+                chat_id=self.config.chat_id,
+                photo=box.file_data,
+                caption=box.caption_text or None,
+                caption_entities=to_entities(box.caption_entities),
+                message_thread_id=topic_id,
+            )
 
     async def send_activity(self, topic_id: int, text: str) -> None:
         await self._send(topic_id, f"<i>{html.escape(text)}</i>", parse_mode=ParseMode.HTML)

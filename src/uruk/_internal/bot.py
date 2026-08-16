@@ -393,10 +393,11 @@ class UrukBot:
             return
         prompt = " ".join(context.args[1:]).strip()
         title = prompt[:60] if prompt else "interactive session"
+        info = TaskInfo(topic_id=0, repo=str(repo), title=title)
         try:
             topic = await self.app.bot.create_forum_topic(
                 chat_id=self.config.chat_id,
-                name=f"{repo.name} · {title}"[:96],
+                name=self._topic_name(info),
             )
         except TelegramError as error:
             await message.reply_text(
@@ -404,7 +405,7 @@ class UrukBot:
                 "an admin with the 'Manage topics' permission?"
             )
             return
-        info = TaskInfo(topic_id=topic.message_thread_id, repo=str(repo), title=title)
+        info.topic_id = topic.message_thread_id
         self.store.set(info)
         task = self._make_task(info)
         self.tasks[info.topic_id] = task
@@ -470,6 +471,24 @@ class UrukBot:
         task = self._get_task(topic_id) if topic_id is not None else None
         return task
 
+    def _topic_name(self, info: TaskInfo) -> str:
+        """Topic name showing the repo, title, and current model/effort (128-char Telegram cap)."""
+        model = info.model or self.config.model or "default"
+        suffix = f" [{model} · {info.effort or 'default'}]"
+        base = f"{Path(info.repo).name} · {info.title}"
+        return f"{base[: 96 - len(suffix)]}{suffix}"
+
+    async def _rename_topic(self, info: TaskInfo) -> None:
+        """Push the current topic name (model/effort included) to Telegram."""
+        try:
+            await self.app.bot.edit_forum_topic(
+                chat_id=self.config.chat_id,
+                message_thread_id=info.topic_id,
+                name=self._topic_name(info),
+            )
+        except TelegramError:
+            logger.warning("failed to rename topic %s", info.topic_id, exc_info=True)
+
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update):
             return
@@ -484,6 +503,7 @@ class UrukBot:
             return
         model = None if context.args[0].lower() == "default" else context.args[0]
         live = await task.set_model(model)
+        await self._rename_topic(task.info)
         shown = model or "(default)"
         when = "applied to the running session" if live else "takes effect when the session starts"
         await message.reply_text(f"Model set to {shown} — {when}.")
@@ -514,6 +534,7 @@ class UrukBot:
             return
         effort = None if value == "default" else value
         await task.set_effort(effort)
+        await self._rename_topic(task.info)
         await message.reply_text(
             f"Effort set to {effort or '(default)'} — applies from your next message (the session resumes)."
         )

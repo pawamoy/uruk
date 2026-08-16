@@ -62,6 +62,7 @@ All commands are sent in the group's *General* topic, except where noted.
 | `/list` | General | List active and resumable sessions. |
 | `/interrupt` | a task topic | Interrupt the current agent turn. |
 | `/close` | a task topic | End the session and close the topic. |
+| `/purge` | anywhere | Delete all topics previously closed with `/close` (needs the *Delete messages* admin permission). |
 | `/model [name\|default]` | a task topic | Show or change the task's model (applies live if the session is running). |
 | `/effort [low\|medium\|high\|xhigh\|max\|default]` | a task topic | Show or change the task's effort level (applies from the next message; the session restarts and resumes). |
 | `/id` | anywhere | Show chat/user IDs (works before authorization, for setup). |

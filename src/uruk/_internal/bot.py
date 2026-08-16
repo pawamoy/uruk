@@ -100,6 +100,7 @@ class UrukBot:
         app.add_handler(CommandHandler("list", self.cmd_list))
         app.add_handler(CommandHandler("interrupt", self.cmd_interrupt))
         app.add_handler(CommandHandler("close", self.cmd_close))
+        app.add_handler(CommandHandler("purge", self.cmd_purge))
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("effort", self.cmd_effort))
         app.add_handler(CallbackQueryHandler(self.on_button))
@@ -372,6 +373,7 @@ class UrukBot:
             "/list — list sessions\n"
             "/interrupt — interrupt the current turn (in a task topic)\n"
             "/close — end the session and close the topic (in a task topic)\n"
+            "/purge — delete all topics previously closed with /close\n"
             "/model [name|default] — show or change this task's model (in a task topic)\n"
             "/effort [low|medium|high|xhigh|max|default] — show or change this task's effort (in a task topic)\n"
             "Any text inside a task topic goes to that session."
@@ -532,6 +534,36 @@ class UrukBot:
         await message.reply_text("Closed.")
         with contextlib.suppress(TelegramError):
             await self.app.bot.close_forum_topic(chat_id=self.config.chat_id, message_thread_id=topic_id)
+        self.store.add_closed(topic_id)
+
+    async def cmd_purge(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        message = update.effective_message
+        closed = self.store.closed()
+        if not closed:
+            await message.reply_text("No closed topics to delete (only topics closed with /close are tracked).")
+            return
+        deleted, failed = 0, 0
+        for topic_id in closed:
+            try:
+                await self.app.bot.delete_forum_topic(chat_id=self.config.chat_id, message_thread_id=topic_id)
+            except TelegramError as error:
+                if "not found" in str(error).lower():  # Already deleted by hand: stop tracking it.
+                    self.store.remove_closed(topic_id)
+                else:
+                    logger.warning("failed to delete topic %s: %s", topic_id, error)
+                    failed += 1
+            else:
+                self.store.remove_closed(topic_id)
+                deleted += 1
+        text = f"🗑 Deleted {deleted} closed topic{'s' if deleted != 1 else ''}."
+        if failed:
+            text += (
+                f"\n⚠️ {failed} could not be deleted — does the bot have the 'Delete messages' "
+                "admin permission? They stay tracked; retry with /purge."
+            )
+        await message.reply_text(text)
 
 
 def main() -> None:

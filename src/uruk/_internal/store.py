@@ -20,17 +20,26 @@ class TaskInfo:
 
 
 class SessionStore:
-    """JSON-file-backed map of topic ID to task info."""
+    """JSON-file-backed map of topic ID to task info, plus the closed topics awaiting deletion."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self._tasks: dict[int, TaskInfo] = {}
+        self._closed: list[int] = []
         if path.is_file():
             data = json.loads(path.read_text(encoding="utf-8"))
-            self._tasks = {int(key): TaskInfo(**value) for key, value in data.items()}
+            if "tasks" in data:
+                tasks = data["tasks"]
+                self._closed = [int(topic_id) for topic_id in data.get("closed_topics", [])]
+            else:  # Legacy format: a flat topic-id-to-info map.
+                tasks = data
+            self._tasks = {int(key): TaskInfo(**value) for key, value in tasks.items()}
 
     def save(self) -> None:
-        data = {str(topic_id): asdict(info) for topic_id, info in self._tasks.items()}
+        data = {
+            "tasks": {str(topic_id): asdict(info) for topic_id, info in self._tasks.items()},
+            "closed_topics": self._closed,
+        }
         self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def get(self, topic_id: int) -> TaskInfo | None:
@@ -46,3 +55,16 @@ class SessionStore:
 
     def all(self) -> list[TaskInfo]:
         return list(self._tasks.values())
+
+    def add_closed(self, topic_id: int) -> None:
+        if topic_id not in self._closed:
+            self._closed.append(topic_id)
+            self.save()
+
+    def remove_closed(self, topic_id: int) -> None:
+        if topic_id in self._closed:
+            self._closed.remove(topic_id)
+            self.save()
+
+    def closed(self) -> list[int]:
+        return list(self._closed)

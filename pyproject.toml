@@ -1,0 +1,20 @@
+[project]
+name = "uruk"
+version = "0.1.0"
+description = "Telegram bot to drive Claude Code agent sessions across repositories from your phone."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.1",
+    "python-telegram-bot>=21.0",
+]
+
+[project.scripts]
+uruk = "uruk:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/uruk"]

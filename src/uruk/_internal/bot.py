@@ -427,13 +427,17 @@ class UrukBot:
             return
         await query.answer()
         await handler(update, context)
+        await self._maybe_show_panel(message.message_thread_id)
 
     def _finish_prompt_dialogue(self, topic_id: int | None, task: asyncio.Task) -> None:
         """Release a finished dialogue and make unexpected failures visible in logs."""
         self.prompt_dialogues.pop(topic_id, None)
-        with contextlib.suppress(asyncio.CancelledError):
-            if error := task.exception():
-                logger.exception("prompt dialogue in topic %s failed", topic_id, exc_info=error)
+        if task.cancelled():
+            return
+        if error := task.exception():
+            logger.exception("prompt dialogue in topic %s failed", topic_id, exc_info=error)
+            return
+        asyncio.get_running_loop().create_task(self._send_panel(topic_id))
 
     async def _run_prompt_dialogue(self, message, topic_id: int | None) -> None:
         """Collect model, effort, repository, and prompt from the command panel."""
@@ -589,6 +593,17 @@ class UrukBot:
         message = update.effective_message
         if not self._is_main_thread(message):
             return
+        await self._maybe_show_panel(message.message_thread_id)
+
+    async def _maybe_show_panel(self, topic_id: int | None) -> None:
+        """Repost the panel, unless a flow in this topic will repost it when it finishes."""
+        for flows in (self.prompt_dialogues, self.auto_runs):
+            flow = flows.get(topic_id)
+            if flow is not None and not flow.done():
+                return
+        await self._send_panel(topic_id)
+
+    async def _send_panel(self, topic_id: int | None) -> None:
         markup = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("🎯 Prompt", callback_data="c:prompt"),
@@ -606,7 +621,8 @@ class UrukBot:
                 InlineKeyboardButton("🆔 IDs", callback_data="c:id"),
             ],
         ])
-        await message.reply_text("Command panel", reply_markup=markup)
+        # The Bot API rejects the General topic's thread id (1) on plain sends.
+        await self._send(None if topic_id == 1 else topic_id, "Command panel", reply_markup=markup)
 
     async def cmd_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -667,9 +683,12 @@ class UrukBot:
     def _finish_auto_run(self, topic_id: int | None, task: asyncio.Task) -> None:
         """Release a completed automatic backlog run and log unexpected errors."""
         self.auto_runs.pop(topic_id, None)
-        with contextlib.suppress(asyncio.CancelledError):
-            if error := task.exception():
-                logger.exception("automatic backlog run in topic %s failed", topic_id, exc_info=error)
+        if task.cancelled():
+            return
+        if error := task.exception():
+            logger.exception("automatic backlog run in topic %s failed", topic_id, exc_info=error)
+            return
+        asyncio.get_running_loop().create_task(self._send_panel(topic_id))
 
     async def _run_auto(self, message, topic_id: int | None, limit: int) -> None:
         try:

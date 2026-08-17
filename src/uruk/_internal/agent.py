@@ -9,10 +9,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import logging
 from collections.abc import Callable
 from typing import Any, Protocol
 
+from loguru import logger
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -27,8 +27,6 @@ from claude_agent_sdk import (
 )
 
 from uruk._internal.store import TaskInfo
-
-logger = logging.getLogger(__name__)
 
 # Tools whose (auto-approved) use is worth a one-line notice in the topic.
 # Reads and searches stay silent; anything that needs approval shows up as a prompt anyway.
@@ -168,7 +166,7 @@ class ClaudeAgentTask:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            logger.exception("session for topic %s crashed", self.info.topic_id)
+            logger.exception("session for topic {} crashed", self.info.topic_id)
             with contextlib.suppress(Exception):
                 await self.ui.send_text(
                     self.info.topic_id,

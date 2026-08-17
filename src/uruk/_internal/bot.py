@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import inspect
 import itertools
 import logging
 import subprocess
@@ -15,6 +16,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+from loguru import logger
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import TelegramError
@@ -37,8 +39,6 @@ from uruk._internal.agent import AgentTask, ClaudeAgentTask, summarize_tool_inpu
 from uruk._internal.codex_agent import CodexAgentTask
 from uruk._internal.config import Config, ConfigError
 from uruk._internal.store import SessionStore, TaskInfo
-
-logger = logging.getLogger(__name__)
 
 MESSAGE_LIMIT = 4000  # Telegram caps messages at 4096 chars; keep headroom.
 MIN_FILE_LINES = 30  # Code blocks longer than this become file attachments.
@@ -165,7 +165,7 @@ class UrukBot:
             return False
         if chat_id == self.config.chat_id and user_id == self.config.owner_id:
             return True
-        logger.warning("ignoring update from chat=%s user=%s", chat_id, user_id)
+        logger.warning("ignoring update from chat={} user={}", chat_id, user_id)
         return False
 
     def _auth(self, update: Update) -> bool:
@@ -216,7 +216,7 @@ class UrukBot:
         try:
             boxes = await telegramify(text, max_message_length=MESSAGE_LIMIT, min_file_lines=MIN_FILE_LINES)
         except Exception:
-            logger.warning("telegramify failed for topic %s, sending plain text", topic_id, exc_info=True)
+            logger.opt(exception=True).warning("telegramify failed for topic {}, sending plain text", topic_id)
             for part in chunk(text):
                 await self._send(topic_id, part)
             return
@@ -224,7 +224,7 @@ class UrukBot:
             try:
                 await self._send_box(topic_id, box)
             except TelegramError:
-                logger.warning("sending %s to topic %s failed", type(box).__name__, topic_id, exc_info=True)
+                logger.opt(exception=True).warning("sending {} to topic {} failed", type(box).__name__, topic_id)
                 if isinstance(box, Text):
                     await self._send(topic_id, box.text)
 
@@ -326,7 +326,7 @@ class UrukBot:
                 **kwargs,
             )
         except TelegramError:
-            logger.exception("failed to send message to topic %s", topic_id)
+            logger.exception("failed to send message to topic {}", topic_id)
 
     # -- button presses ------------------------------------------------------------
 
@@ -439,7 +439,7 @@ class UrukBot:
         if task.cancelled():
             return
         if error := task.exception():
-            logger.exception("prompt dialogue in topic %s failed", topic_id, exc_info=error)
+            logger.opt(exception=error).error("prompt dialogue in topic {} failed", topic_id)
             return
         asyncio.get_running_loop().create_task(self._send_panel(topic_id))
 
@@ -690,7 +690,7 @@ class UrukBot:
         if task.cancelled():
             return
         if error := task.exception():
-            logger.exception("automatic backlog run in topic %s failed", topic_id, exc_info=error)
+            logger.opt(exception=error).error("automatic backlog run in topic {} failed", topic_id)
             return
         asyncio.get_running_loop().create_task(self._send_panel(topic_id))
 
@@ -1019,7 +1019,7 @@ class UrukBot:
                 message_thread_id=info.topic_id,
             )
         except TelegramError:
-            logger.warning("failed to send status message to topic %s", info.topic_id, exc_info=True)
+            logger.opt(exception=True).warning("failed to send status message to topic {}", info.topic_id)
             return
         info.status_message_id = message.message_id
         self.store.save()
@@ -1028,12 +1028,11 @@ class UrukBot:
                 chat_id=self.config.chat_id,
                 message_id=message.message_id,
             )
-        except Exception as error:
+        except Exception:
             logger.exception(
-                "failed to unpin status message %s in topic %s before pinning: %s",
+                "failed to unpin status message {} in topic {} before pinning",
                 message.message_id,
                 info.topic_id,
-                error,
             )
         try:
             await self.app.bot.pin_chat_message(
@@ -1041,12 +1040,11 @@ class UrukBot:
                 message_id=message.message_id,
                 disable_notification=True,
             )
-        except Exception as error:
+        except Exception:
             logger.exception(
-                "failed to pin status message %s in topic %s: %s",
+                "failed to pin status message {} in topic {}",
                 message.message_id,
                 info.topic_id,
-                error,
             )
 
     async def refresh_status(self, topic_id: int) -> None:
@@ -1068,7 +1066,7 @@ class UrukBot:
             )
         except TelegramError as error:
             if "not modified" not in str(error).lower():
-                logger.warning("failed to update status message for topic %s", info.topic_id, exc_info=True)
+                logger.opt(exception=True).warning("failed to update status message for topic {}", info.topic_id)
 
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update):
@@ -1166,7 +1164,7 @@ class UrukBot:
                 if "not found" in str(error).lower():  # Already deleted by hand: stop tracking it.
                     self.store.remove_closed(topic_id)
                 else:
-                    logger.warning("failed to delete topic %s: %s", topic_id, error)
+                    logger.warning("failed to delete topic {}: {}", topic_id, error)
                     failed += 1
             else:
                 self.store.remove_closed(topic_id)
@@ -1201,7 +1199,7 @@ class UrukBot:
                 )
             except TelegramError as error:
                 if "thread not found" not in str(error).lower():
-                    logger.warning("could not probe topic %s: %s", info.topic_id, error)
+                    logger.warning("could not probe topic {}: {}", info.topic_id, error)
                     continue
                 task = self.tasks.pop(info.topic_id, None)
                 if task is not None:
@@ -1212,8 +1210,25 @@ class UrukBot:
         return orphaned
 
 
+class InterceptHandler(logging.Handler):
+    """Route stdlib logging records (telegram, httpx, …) through loguru."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        # Walk back to the caller emitting the record, so loguru reports it
+        # instead of this handler.
+        frame, depth = inspect.currentframe(), 0
+        while frame and (depth == 0 or frame.f_code.co_filename == logging.__file__):
+            frame = frame.f_back
+            depth += 1
+        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+
+
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(handlers=[InterceptHandler()], level=logging.INFO, force=True)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         config = Config.from_env()

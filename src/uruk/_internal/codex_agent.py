@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 from collections.abc import Callable
 from typing import Any
 
+from loguru import logger
 from openai_codex import (
     ApprovalMode,
     AsyncCodex,
@@ -20,8 +20,6 @@ from openai_codex.types import Notification, ReasoningEffort
 
 from uruk._internal.agent import UI
 from uruk._internal.store import TaskInfo
-
-logger = logging.getLogger(__name__)
 
 
 class CodexAgentTask:
@@ -113,7 +111,7 @@ class CodexAgentTask:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            logger.exception("Codex session for topic %s crashed", self.info.topic_id)
+            logger.exception("Codex session for topic {} crashed", self.info.topic_id)
             with contextlib.suppress(Exception):
                 await self.ui.send_text(
                     self.info.topic_id,

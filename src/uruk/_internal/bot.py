@@ -80,7 +80,11 @@ def chunk(text: str, limit: int = MESSAGE_LIMIT) -> Iterator[str]:
 
 
 def to_entities(entities: list) -> list[MessageEntity] | None:
-    """Convert telegramify-markdown entities to python-telegram-bot ones."""
+    """Convert telegramify-markdown entities to python-telegram-bot ones.
+
+    Telegram rejects the whole message if any link entity has a URL without a
+    host (agents like to link local paths), so those links become plain text.
+    """
     return [
         MessageEntity(
             type=entity.type,
@@ -91,6 +95,7 @@ def to_entities(entities: list) -> list[MessageEntity] | None:
             custom_emoji_id=entity.custom_emoji_id,
         )
         for entity in entities
+        if entity.url is None or urlparse(entity.url).netloc
     ] or None
 
 

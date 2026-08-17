@@ -12,6 +12,7 @@ import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
 from telegram.constants import ChatAction, ParseMode
@@ -27,11 +28,9 @@ from telegram.ext import (
 from telegramify_markdown import telegramify
 from telegramify_markdown.content import ContentType, File, Photo, Text
 
-from insiders._internal.clients.github import GitHub
-from insiders._internal.config import Config as InsidersConfig
-from insiders._internal.config import Unset as InsidersUnset
-from insiders._internal.models import Issue
-from insiders._internal.ops.backlog import get_backlog
+from insiders import Config as InsidersConfig
+from insiders import GitHub, Issue, get_backlog
+from insiders import Unset as InsidersUnset
 
 from uruk._internal.agent import AgentTask, ClaudeAgentTask, summarize_tool_input
 from uruk._internal.codex_agent import CodexAgentTask
@@ -629,7 +628,7 @@ class UrukBot:
             "/auto [N] — offer the first N configured backlog items as new tasks (in General)\n"
             "/interrupt — interrupt the current turn (in a task topic)\n"
             "/close — end the session and close the topic (in a task topic)\n"
-            "/purge — delete all topics previously closed with /close\n"
+            "/purge — delete topics closed with /close, and forget sessions whose topics were deleted by hand\n"
             "/model [name|default] — show or change this task's model (in a task topic)\n"
             "/effort [low|medium|high|xhigh|max|default] — show or change this task's effort (in a task topic)\n"
             "Any text inside a task topic goes to that session."
@@ -1087,12 +1086,8 @@ class UrukBot:
         if not self._auth(update):
             return
         message = update.effective_message
-        closed = self.store.closed()
-        if not closed:
-            await message.reply_text("No closed topics to delete (only topics closed with /close are tracked).")
-            return
         deleted, failed = 0, 0
-        for topic_id in closed:
+        for topic_id in self.store.closed():
             try:
                 await self.app.bot.delete_forum_topic(chat_id=self.config.chat_id, message_thread_id=topic_id)
             except TelegramError as error:
@@ -1104,13 +1099,45 @@ class UrukBot:
             else:
                 self.store.remove_closed(topic_id)
                 deleted += 1
-        text = f"🗑 Deleted {deleted} closed topic{'s' if deleted != 1 else ''}."
+        orphaned = await self._purge_orphaned_sessions()
+        if not deleted and not failed and not orphaned:
+            await message.reply_text("Nothing to purge: no closed topics, and every session still has its topic.")
+            return
+        lines = [f"🗑 Deleted {deleted} closed topic{'s' if deleted != 1 else ''}."]
+        if orphaned:
+            lines.append(f"🧹 Forgot {orphaned} session{'s' if orphaned != 1 else ''} whose topic no longer exists.")
         if failed:
-            text += (
-                f"\n⚠️ {failed} could not be deleted — does the bot have the 'Delete messages' "
+            lines.append(
+                f"⚠️ {failed} could not be deleted — does the bot have the 'Delete messages' "
                 "admin permission? They stay tracked; retry with /purge."
             )
-        await message.reply_text(text)
+        await message.reply_text("\n".join(lines))
+
+    async def _purge_orphaned_sessions(self) -> int:
+        """Forget sessions whose topics were deleted by hand, where /close was impossible.
+
+        The Bot API cannot look up a forum topic, but sending a chat action to its
+        thread fails with "message thread not found" once the topic is deleted.
+        """
+        orphaned = 0
+        for info in self.store.all():
+            try:
+                await self.app.bot.send_chat_action(
+                    chat_id=self.config.chat_id,
+                    action=ChatAction.TYPING,
+                    message_thread_id=info.topic_id,
+                )
+            except TelegramError as error:
+                if "thread not found" not in str(error).lower():
+                    logger.warning("could not probe topic %s: %s", info.topic_id, error)
+                    continue
+                task = self.tasks.pop(info.topic_id, None)
+                if task is not None:
+                    await task.close()
+                self.store.remove(info.topic_id)
+                self.awaiting_text.pop(info.topic_id, None)
+                orphaned += 1
+        return orphaned
 
 
 def main() -> None:

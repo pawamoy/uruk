@@ -95,7 +95,6 @@ class UrukBot:
         app.add_handler(CommandHandler("id", self.cmd_id))
         app.add_handler(CommandHandler("start", self.cmd_help))
         app.add_handler(CommandHandler("help", self.cmd_help))
-        app.add_handler(CommandHandler("new", self.cmd_new))
         app.add_handler(CommandHandler("repos", self.cmd_repos))
         app.add_handler(CommandHandler("list", self.cmd_list))
         app.add_handler(CommandHandler("interrupt", self.cmd_interrupt))
@@ -103,6 +102,7 @@ class UrukBot:
         app.add_handler(CommandHandler("purge", self.cmd_purge))
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("effort", self.cmd_effort))
+        app.add_handler(CommandHandler(tuple(MODEL_COMMANDS), self.cmd_new_model))
         app.add_handler(CallbackQueryHandler(self.on_button))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
 
@@ -137,7 +137,13 @@ class UrukBot:
         return task
 
     def _make_task(self, info: TaskInfo) -> AgentTask:
-        return AgentTask(
+        if info.provider == "openai":
+            return CodexAgentTask(
+                ui=self,
+                info=info,
+                on_state_change=self.store.save,
+            )
+        return ClaudeAgentTask(
             ui=self,
             info=info,
             permission_mode=self.config.permission_mode,
@@ -341,12 +347,17 @@ class UrukBot:
             return
 
         if topic_id is None:
-            await message.reply_text("Send messages inside a task topic, or start one with /new <repo> <task>.")
+            await message.reply_text(
+                "Send messages inside a task topic, or start one with "
+                "/<model> [--<effort>] <repo> <task>."
+            )
             return
 
         task = self._get_task(topic_id)
         if task is None:
-            await message.reply_text("No session is attached to this topic. Start one with /new in the General topic.")
+            await message.reply_text(
+                "No session is attached to this topic. Start one with a model command in the General topic."
+            )
             return
         await task.submit(message.text)
         with contextlib.suppress(TelegramError):
@@ -368,7 +379,7 @@ class UrukBot:
         if not self._auth(update):
             return
         await update.effective_message.reply_text(
-            "/new <repo> [task…] — start a session (topic per task)\n"
+            "/<fable|opus|sonnet|haiku|sol|terra|luna> [--<effort>] <repo> [task…] — start a session\n"
             "/repos — list repositories\n"
             "/list — list sessions\n"
             "/interrupt — interrupt the current turn (in a task topic)\n"
@@ -427,7 +438,9 @@ class UrukBot:
         if not self._auth(update):
             return
         if self.config.repos_root is None:
-            await update.effective_message.reply_text("URUK_REPOS_ROOT is not set; use absolute paths with /new.")
+            await update.effective_message.reply_text(
+                "URUK_REPOS_ROOT is not set; use an absolute path with your model command."
+            )
             return
         names = sorted(
             path.name for path in self.config.repos_root.iterdir()
@@ -498,14 +511,29 @@ class UrukBot:
             await message.reply_text("Use /model inside a task topic.")
             return
         if not context.args:
-            current = task.info.model or self.config.model or "(default)"
+            current = task.info.resolved_model or task.info.model
+            if current is None and task.info.provider == "claude":
+                current = self.config.model
+            current = MODEL_LABELS.get(current, current or "(default)")
             await message.reply_text(f"Model: {current}\nChange with /model <name>, reset with /model default.")
             return
-        model = None if context.args[0].lower() == "default" else context.args[0]
+        requested = context.args[0].lower()
+        model = None if requested == "default" else requested
+        if model in MODEL_COMMANDS:
+            provider, canonical_model = MODEL_COMMANDS[model]
+            if provider != task.info.provider:
+                await message.reply_text(
+                    "A task cannot switch SDK providers. Start a new topic with that model command."
+                )
+                return
+            model = canonical_model
         live = await task.set_model(model)
-        await self._rename_topic(task.info)
-        shown = model or "(default)"
-        when = "applied to the running session" if live else "takes effect when the session starts"
+        await self._update_status(task.info)
+        shown = MODEL_LABELS.get(model, model or "(default)")
+        if task.info.provider == "openai":
+            when = "takes effect from the next turn"
+        else:
+            when = "applied to the running session" if live else "takes effect when the session starts"
         await message.reply_text(f"Model set to {shown} — {when}.")
 
     async def cmd_effort(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -517,26 +545,27 @@ class UrukBot:
             await message.reply_text("Use /effort inside a task topic.")
             return
         if not context.args:
+            default_effort = "default" if task.info.provider == "openai" else "high (default)"
             await message.reply_text(
-                f"Effort: {task.info.effort or '(default)'}\n"
+                f"Effort: {task.info.effort or default_effort}\n"
                 "Change with /effort <low|medium|high|xhigh|max>, reset with /effort default."
             )
             return
         value = context.args[0].lower()
-        if value not in {"low", "medium", "high", "xhigh", "max", "default"}:
+        if value not in {*EFFORT_LEVELS, "default"}:
             await message.reply_text("Effort must be one of: low, medium, high, xhigh, max, default.")
             return
         if task.turn_running:
             await message.reply_text(
-                "A turn is running; effort changes require a session restart. "
+                "A turn is running; effort changes apply between turns. "
                 "Wait for it to finish (or /interrupt), then retry."
             )
             return
         effort = None if value == "default" else value
         await task.set_effort(effort)
-        await self._rename_topic(task.info)
+        await self._update_status(task.info)
         await message.reply_text(
-            f"Effort set to {effort or '(default)'} — applies from your next message (the session resumes)."
+            f"Effort set to {effort or '(default)'} — applies from your next message."
         )
 
     async def cmd_close(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

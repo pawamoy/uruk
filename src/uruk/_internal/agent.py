@@ -1,4 +1,4 @@
-"""Agent sessions on top of the Claude Agent SDK.
+"""Shared agent interface and the Claude Agent SDK implementation.
 
 Each `AgentTask` owns one SDK session (one `claude` subprocess) pinned to a repository,
 fed by a queue of user prompts and reporting everything through a `UI` object.
@@ -20,6 +20,7 @@ from claude_agent_sdk import (
     PermissionResultAllow,
     PermissionResultDeny,
     ResultMessage,
+    SystemMessage,
     TextBlock,
     ToolPermissionContext,
     ToolUseBlock,
@@ -42,6 +43,23 @@ class UI(Protocol):
     async def send_typing(self, topic_id: int) -> None: ...
     async def ask_permission(self, topic_id: int, tool_name: str, input_data: dict) -> bool: ...
     async def ask_question(self, topic_id: int, question: dict) -> str: ...
+    async def refresh_status(self, topic_id: int) -> None: ...
+
+
+class AgentTask(Protocol):
+    """Provider-neutral task interface used by the Telegram bot."""
+
+    info: TaskInfo
+    turn_running: bool
+
+    @property
+    def active(self) -> bool: ...
+
+    async def submit(self, text: str) -> None: ...
+    async def interrupt(self) -> bool: ...
+    async def close(self) -> None: ...
+    async def set_model(self, model: str | None) -> bool: ...
+    async def set_effort(self, effort: str | None) -> None: ...
 
 
 def summarize_tool_input(tool_name: str, input_data: dict[str, Any]) -> str:
@@ -56,8 +74,8 @@ def summarize_tool_input(tool_name: str, input_data: dict[str, Any]) -> str:
     return json.dumps(input_data, indent=2, ensure_ascii=False, default=str)
 
 
-class AgentTask:
-    """One live agent session bound to a repository and a Telegram topic."""
+class ClaudeAgentTask:
+    """One live Claude session bound to a repository and a Telegram topic."""
 
     def __init__(
         self,
@@ -106,6 +124,8 @@ class AgentTask:
         """Change the model. Returns whether it was applied to a live session
         (otherwise it takes effect when the session next starts)."""
         self.info.model = model
+        # The old resolved model is stale now; the next session init reports the new one.
+        self.info.resolved_model = None
         self.on_state_change()
         if self._client is not None:
             await self._client.set_model(model)
@@ -168,7 +188,13 @@ class AgentTask:
             return
 
     async def _handle_message(self, message: object) -> None:
-        if isinstance(message, AssistantMessage):
+        if isinstance(message, SystemMessage) and message.subtype == "init":
+            model = message.data.get("model")
+            if model and model != self.info.resolved_model:
+                self.info.resolved_model = model
+                self.on_state_change()
+                await self.ui.refresh_status(self.info.topic_id)
+        elif isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, TextBlock) and block.text.strip():
                     await self.ui.send_text(self.info.topic_id, block.text)

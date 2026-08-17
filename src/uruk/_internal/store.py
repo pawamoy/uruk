@@ -14,9 +14,12 @@ class TaskInfo:
     topic_id: int
     repo: str
     title: str
+    provider: str = "claude"
     session_id: str | None = None
     model: str | None = None
     effort: str | None = None
+    status_message_id: int | None = None
+    resolved_model: str | None = None  # Actual model reported by the session's init message.
 
 
 class SessionStore:

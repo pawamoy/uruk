@@ -1,11 +1,13 @@
 # Uruk
 
-Control [Claude Code](https://claude.com/claude-code) agent sessions from your phone, through Telegram.
+Control [Claude Code](https://claude.com/claude-code) and
+[OpenAI Codex](https://developers.openai.com/codex/) agent sessions from your phone, through Telegram.
 
-Uruk runs on your dev machine and drives one Claude Agent SDK session per task, each in its own
-repository and its own Telegram **forum topic**. Agent output streams into the topic, your replies
-feed back into the session, and anything that needs your approval (shell commands, pushes, the
-agent's clarifying questions) shows up as inline buttons on your phone.
+Uruk runs on your dev machine and drives one Claude Agent SDK or OpenAI Codex SDK session per
+task, each in its own repository and its own Telegram **forum topic**. Agent output streams into
+the topic and your replies feed back into the session. Claude actions that need your approval show
+up as inline buttons on your phone; Codex uses its automatic reviewer inside a workspace-write
+sandbox.
 
 ```
 Telegram cloud  ⟵ long-poll ⟶  uruk (this bot)  ──┬── agent session (repo A, task 1)
@@ -17,7 +19,9 @@ No public endpoint, no open ports: the bot long-polls Telegram.
 
 ## Requirements
 
-- The `claude` CLI installed and logged in (sessions use its credentials).
+- The `claude` CLI installed and logged in for Claude sessions.
+- Codex logged in (`uv run codex login`) for Sol, Terra, and Luna sessions. The Python package includes
+  its own compatible Codex runtime.
 - A Telegram bot token and a private group with topics enabled (setup below).
 - Python ≥ 3.12 and [uv](https://docs.astral.sh/uv/) (or pip).
 
@@ -40,9 +44,9 @@ No public endpoint, no open ports: the bot long-polls Telegram.
    | `TELEGRAM_BOT_TOKEN` | yes | Token from BotFather. |
    | `TELEGRAM_CHAT_ID` | yes | The group's chat ID (negative number). |
    | `TELEGRAM_OWNER_ID` | yes | Your Telegram user ID. Everyone else is ignored. |
-   | `URUK_REPOS_ROOT` | no | Directory containing your repositories. Lets you write `/new myrepo …` instead of an absolute path. |
-   | `URUK_PERMISSION_MODE` | no | Agent permission mode: `default`, `acceptEdits` (default), `plan`, `bypassPermissions` (don't). |
-   | `URUK_MODEL` | no | Model override passed to the SDK. |
+   | `URUK_REPOS_ROOT` | no | Directory containing your repositories. Lets you write `/fable myrepo …` instead of an absolute path. |
+   | `URUK_PERMISSION_MODE` | no | Claude permission mode: `default`, `acceptEdits` (default), `plan`, `bypassPermissions` (don't). Codex always uses workspace-write plus automatic review. |
+   | `URUK_MODEL` | no | Default model override passed to the Claude SDK. |
    | `URUK_DATA_DIR` | no | Where session state is persisted (default `~/.local/share/uruk`). |
 
 6. **Run it**:
@@ -57,14 +61,14 @@ All commands are sent in the group's *General* topic, except where noted.
 
 | Command | Where | Effect |
 |---|---|---|
-| `/new <repo> [task…]` | General | Start a session in `<repo>` (absolute path, or relative to `URUK_REPOS_ROOT`). Creates a topic; the rest of the line is the first prompt. |
+| `/<model> [--<effort>] <repo> [task…]` | General | Start a Claude session with `fable`, `opus`, `sonnet`, or `haiku`, or a Codex session with `sol`, `terra`, or `luna`, in `<repo>` (absolute path, or relative to `URUK_REPOS_ROOT`). Effort is optionally `--low`, `--medium`, `--high`, `--xhigh`, or `--max`; the rest of the line is the first prompt. Examples: `/fable --max myrepo Fix the tests`, `/terra --high myrepo Review this diff`. |
 | `/repos` | General | List directories under `URUK_REPOS_ROOT`. |
 | `/list` | General | List active and resumable sessions. |
 | `/interrupt` | a task topic | Interrupt the current agent turn. |
 | `/close` | a task topic | End the session and close the topic. |
 | `/purge` | anywhere | Delete all topics previously closed with `/close` (needs the *Delete messages* admin permission). |
-| `/model [name\|default]` | a task topic | Show or change the task's model (applies live if the session is running). |
-| `/effort [low\|medium\|high\|xhigh\|max\|default]` | a task topic | Show or change the task's effort level (applies from the next message; the session restarts and resumes). |
+| `/model [name\|default]` | a task topic | Show or change the task's model within its current provider. Switching between Claude and Codex requires a new topic. |
+| `/effort [low\|medium\|high\|xhigh\|max\|default]` | a task topic | Show or change the task's effort level from the next message. |
 | `/id` | anywhere | Show chat/user IDs (works before authorization, for setup). |
 | any text | a task topic | Sent to that task's session. If the agent is mid-turn, it's queued for the next turn. |
 

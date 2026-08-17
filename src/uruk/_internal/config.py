@@ -20,6 +20,7 @@ class Config:
     permission_mode: str
     model: str | None
     data_dir: Path
+    repo_prefixes: dict[str, str]
 
     @property
     def configured(self) -> bool:
@@ -49,6 +50,16 @@ class Config:
         data_dir = Path(os.environ.get("URUK_DATA_DIR", "~/.local/share/uruk")).expanduser()
         data_dir.mkdir(parents=True, exist_ok=True)
 
+        repo_prefixes = {}
+        for entry in os.environ.get("URUK_REPO_PREFIXES", "").split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            owner, separator, prefix = entry.partition("=")
+            if not separator or not owner.strip():
+                raise ConfigError(f"URUK_REPO_PREFIXES entries must look like owner=prefix, got {entry!r}")
+            repo_prefixes[owner.strip()] = prefix.strip()
+
         return cls(
             token=token,
             chat_id=_int("TELEGRAM_CHAT_ID"),
@@ -57,4 +68,5 @@ class Config:
             permission_mode=os.environ.get("URUK_PERMISSION_MODE", "acceptEdits"),
             model=os.environ.get("URUK_MODEL") or None,
             data_dir=data_dir,
+            repo_prefixes=repo_prefixes,
         )

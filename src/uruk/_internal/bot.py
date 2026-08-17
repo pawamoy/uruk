@@ -802,8 +802,23 @@ class UrukBot:
         return backlog.issues
 
     def _repo_for_backlog_issue(self, issue: Issue) -> Path | None:
-        """Map GitHub owner/repository names to same-named local repositories."""
-        return self._resolve_repo(Path(issue.repository).name)
+        """Map GitHub owner/repository names to local repositories.
+
+        With URUK_REPO_PREFIXES (owner=prefix pairs), the owner's prefix is tried
+        first (mkdocstrings/python -> mkdocstrings-python), then the plain name,
+        which also covers eponymous repos (mkdocstrings/mkdocstrings -> mkdocstrings).
+        """
+        owner, _, name = issue.repository.partition("/")
+        candidates = []
+        prefix = self.config.repo_prefixes.get(owner)
+        if prefix is not None:
+            candidates.append(f"{prefix}{name}")
+        candidates.append(name)
+        for candidate in candidates:
+            repo = self._resolve_repo(candidate)
+            if repo is not None:
+                return repo
+        return None
 
     async def _ask_auto_model(self, topic_id: int | None, issue: Issue) -> str | None:
         """Ask which model, if any, should start the current backlog issue."""

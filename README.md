@@ -48,6 +48,7 @@ No public endpoint, no open ports: the bot long-polls Telegram.
    | `URUK_PERMISSION_MODE` | no | Claude permission mode: `default`, `acceptEdits` (default), `plan`, `bypassPermissions` (don't). Codex always uses workspace-write plus automatic review. |
    | `URUK_MODEL` | no | Default model override passed to the Claude SDK. |
    | `URUK_DATA_DIR` | no | Where session state is persisted (default `~/.local/share/uruk`). |
+   | `URUK_REPO_PREFIXES` | no | Comma-separated `owner=prefix` pairs mapping GitHub owners to local directory prefixes for `/auto`, e.g. `mkdocstrings=mkdocstrings-` matches `mkdocstrings/python` to `mkdocstrings-python`. The plain repo name is the fallback, so `mkdocstrings/mkdocstrings` still matches `mkdocstrings`. |
 
 6. **Run it**:
 

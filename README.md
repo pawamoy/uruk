@@ -59,11 +59,20 @@ No public endpoint, no open ports: the bot long-polls Telegram.
 
 All commands are sent in the group's *General* topic, except where noted.
 
+After every command sent in General, Uruk posts a shortcut panel. Its **Prompt**
+button starts a guided flow to choose the model, reasoning effort, repository
+(with text filtering), and task prompt.
+
+`/auto` reads the backlog namespaces and sorting rules from the default
+`insiders` configuration, then obtains a GitHub token from `gh auth token` at
+runtime. Authenticate the GitHub CLI on the machine running Uruk first.
+
 | Command | Where | Effect |
 |---|---|---|
 | `/<model> [--<effort>] <repo> [task…]` | General | Start a Claude session with `fable`, `opus`, `sonnet`, or `haiku`, or a Codex session with `sol`, `terra`, or `luna`, in `<repo>` (absolute path, or relative to `URUK_REPOS_ROOT`). Effort is optionally `--low`, `--medium`, `--high`, `--xhigh`, or `--max`; the rest of the line is the first prompt. Examples: `/fable --max myrepo Fix the tests`, `/terra --high myrepo Review this diff`. |
 | `/repos` | General | List directories under `URUK_REPOS_ROOT`. |
 | `/list` | General | List active and resumable sessions. |
+| `/auto [N]` | General | Fetch the first `N` configured Insiders backlog items (default 5), then offer each as a new task with a model-selection button. It uses the active `gh` login and matches GitHub repositories to same-named local directories. |
 | `/interrupt` | a task topic | Interrupt the current agent turn. |
 | `/close` | a task topic | End the session and close the topic. |
 | `/purge` | anywhere | Delete all topics previously closed with `/close` (needs the *Delete messages* admin permission). |
@@ -72,7 +81,7 @@ All commands are sent in the group's *General* topic, except where noted.
 | `/id` | anywhere | Show chat/user IDs (works before authorization, for setup). |
 | any text | a task topic | Sent to that task's session. If the agent is mid-turn, it's queued for the next turn. |
 
-Approval prompts appear as **✅ Allow / ❌ Deny** buttons. The agent's clarifying questions appear
+Claude approval prompts appear as **✅ Allow / ❌ Deny** buttons. The agent's clarifying questions appear
 with one button per option (plus **✍️ Other…** to answer with free text — your next message in the
 topic is taken as the answer).
 

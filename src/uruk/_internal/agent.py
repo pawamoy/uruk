@@ -1,7 +1,7 @@
 """Shared agent interface and the Claude Agent SDK implementation.
 
-Each `AgentTask` owns one SDK session (one `claude` subprocess) pinned to a repository,
-fed by a queue of user prompts and reporting everything through a `UI` object.
+Each task owns one SDK session pinned to a repository, is fed by a queue of user
+prompts, and reports everything through a `UI` object.
 """
 
 from __future__ import annotations
@@ -208,12 +208,6 @@ class ClaudeAgentTask:
                 self.on_state_change()
             if message.is_error:
                 await self.ui.send_activity(self.info.topic_id, f"⚠️ turn ended with error: {message.subtype}")
-            else:
-                parts = ["✅ done"]
-                if message.total_cost_usd:
-                    parts.append(f"${message.total_cost_usd:.2f}")
-                parts.append(f"{message.duration_ms / 1000:.0f}s")
-                await self.ui.send_activity(self.info.topic_id, " · ".join(parts))
 
     async def _on_permission(
         self,

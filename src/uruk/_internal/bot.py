@@ -7,6 +7,7 @@ import contextlib
 import html
 import itertools
 import logging
+import subprocess
 import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -26,7 +27,14 @@ from telegram.ext import (
 from telegramify_markdown import telegramify
 from telegramify_markdown.content import ContentType, File, Photo, Text
 
-from uruk._internal.agent import AgentTask, summarize_tool_input
+from insiders._internal.clients.github import GitHub
+from insiders._internal.config import Config as InsidersConfig
+from insiders._internal.config import Unset as InsidersUnset
+from insiders._internal.models import Issue
+from insiders._internal.ops.backlog import get_backlog
+
+from uruk._internal.agent import AgentTask, ClaudeAgentTask, summarize_tool_input
+from uruk._internal.codex_agent import CodexAgentTask
 from uruk._internal.config import Config, ConfigError
 from uruk._internal.store import SessionStore, TaskInfo
 
@@ -34,6 +42,28 @@ logger = logging.getLogger(__name__)
 
 MESSAGE_LIMIT = 4000  # Telegram caps messages at 4096 chars; keep headroom.
 MIN_FILE_LINES = 30  # Code blocks longer than this become file attachments.
+MODEL_COMMANDS = {
+    "fable": ("claude", "fable"),
+    "opus": ("claude", "opus"),
+    "sonnet": ("claude", "sonnet"),
+    "haiku": ("claude", "haiku"),
+    "sol": ("openai", "gpt-5.6-sol"),
+    "terra": ("openai", "gpt-5.6-terra"),
+    "luna": ("openai", "gpt-5.6-luna"),
+}
+MODEL_LABELS = {model: command for command, (_, model) in MODEL_COMMANDS.items()}
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+EFFORT_PREFIXES = ("--", "–", "—")  # ASCII double hyphen, en dash, em dash.
+AUTO_DEFAULT_LIMIT = 5
+AUTO_MAX_LIMIT = 20
+
+
+def parse_effort_flag(argument: str) -> str | None:
+    """Return an effort value from an ASCII or Telegram-smart-dash flag."""
+    for prefix in EFFORT_PREFIXES:
+        if argument.startswith(prefix):
+            return argument.removeprefix(prefix).lower()
+    return None
 
 
 def chunk(text: str, limit: int = MESSAGE_LIMIT) -> Iterator[str]:
@@ -68,9 +98,9 @@ def to_entities(entities: list) -> list[MessageEntity] | None:
 class Pending:
     """An interaction waiting for a button press."""
 
-    kind: str  # "perm" or "question"
+    kind: str  # "perm", "question", or "auto"
     future: asyncio.Future
-    topic_id: int
+    topic_id: int | None
     options: list[str] = field(default_factory=list)
     multi: bool = False
     selected: set[int] = field(default_factory=set)
@@ -84,7 +114,9 @@ class UrukBot:
         self.store = SessionStore(config.data_dir / "sessions.json")
         self.tasks: dict[int, AgentTask] = {}
         self.pending: dict[int, Pending] = {}
-        self.awaiting_text: dict[int, asyncio.Future] = {}
+        self.awaiting_text: dict[int | None, asyncio.Future] = {}
+        self.prompt_dialogues: dict[int | None, asyncio.Task] = {}
+        self.auto_runs: dict[int | None, asyncio.Task] = {}
         self._pid = itertools.count(1)
         self.app: Application | None = None
 
@@ -100,13 +132,23 @@ class UrukBot:
         app.add_handler(CommandHandler("interrupt", self.cmd_interrupt))
         app.add_handler(CommandHandler("close", self.cmd_close))
         app.add_handler(CommandHandler("purge", self.cmd_purge))
+        app.add_handler(CommandHandler("auto", self.cmd_auto))
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("effort", self.cmd_effort))
         app.add_handler(CommandHandler(tuple(MODEL_COMMANDS), self.cmd_new_model))
         app.add_handler(CallbackQueryHandler(self.on_button))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
+        # Handler groups are processed in order. This deliberately comes after the
+        # command handlers so the panel follows each command's response.
+        app.add_handler(MessageHandler(filters.COMMAND, self.show_command_panel), group=1)
 
     async def shutdown(self, app: Application) -> None:
+        for dialogue in self.prompt_dialogues.values():
+            dialogue.cancel()
+        self.prompt_dialogues.clear()
+        for run in self.auto_runs.values():
+            run.cancel()
+        self.auto_runs.clear()
         for task in list(self.tasks.values()):
             await task.close()
 
@@ -123,6 +165,15 @@ class UrukBot:
             update.effective_user.id if update.effective_user else None,
             update.effective_chat.id if update.effective_chat else None,
         )
+
+    @staticmethod
+    def _is_main_thread(message) -> bool:
+        """Whether a message is in a chat's main/General thread.
+
+        Telegram identifies the General forum topic as thread 1. Non-forum chats
+        do not have a thread id, which is also their main thread.
+        """
+        return message.message_thread_id in (None, 1)
 
     def _get_task(self, topic_id: int) -> AgentTask | None:
         """Return the task for a topic, reviving it from the store if needed."""
@@ -276,14 +327,21 @@ class UrukBot:
         if not self._authorized(query.from_user.id, query.message.chat.id if query.message else None):
             await query.answer()
             return
-        kind, pid_str, arg = query.data.split(":", 2)
-        pending = self.pending.get(int(pid_str))
+        if query.data.startswith("c:"):
+            await self._handle_command_button(update, context)
+            return
+        try:
+            kind, pid_str, arg = query.data.split(":", 2)
+            pid = int(pid_str)
+        except (AttributeError, ValueError):
+            await query.answer("Unknown action.")
+            return
+        pending = self.pending.get(pid)
         if pending is None or pending.future.done():
             await query.answer("Expired.")
             with contextlib.suppress(TelegramError):
                 await query.edit_message_reply_markup(None)
             return
-        pid = int(pid_str)
 
         if kind == "p":
             allowed = arg == "a"
@@ -321,6 +379,161 @@ class UrukBot:
                     pending.future.set_result(answer)
                     await query.answer()
                     await self._finalize(query, f"→ {answer}")
+
+        if kind == "a":
+            if arg != "skip" and arg not in MODEL_COMMANDS:
+                await query.answer("Unknown model.")
+                return
+            del self.pending[pid]
+            pending.future.set_result(None if arg == "skip" else arg)
+            await query.answer()
+            await self._finalize(query, "⏭ Skipped" if arg == "skip" else f"→ {arg}")
+            return
+
+    async def _handle_command_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Dispatch a shortcut from the persistent command panel."""
+        query = update.callback_query
+        message = query.message
+        if message is None or not self._is_main_thread(message):
+            await query.answer("Use the command panel in General.")
+            return
+        command = query.data.removeprefix("c:")
+        handlers = {
+            "auto": self.cmd_auto,
+            "purge": self.cmd_purge,
+            "repos": self.cmd_repos,
+            "list": self.cmd_list,
+            "help": self.cmd_help,
+            "id": self.cmd_id,
+        }
+        if command == "prompt":
+            topic_id = message.message_thread_id
+            dialogue = self.prompt_dialogues.get(topic_id)
+            if dialogue is not None and not dialogue.done():
+                await query.answer("A prompt setup is already in progress.")
+                return
+            dialogue = asyncio.create_task(self._run_prompt_dialogue(message, topic_id))
+            self.prompt_dialogues[topic_id] = dialogue
+            dialogue.add_done_callback(lambda task: self._finish_prompt_dialogue(topic_id, task))
+            await query.answer("Prompt setup started")
+            return
+        handler = handlers.get(command)
+        if handler is None:
+            await query.answer("Unknown action.")
+            return
+        await query.answer()
+        await handler(update, context)
+
+    def _finish_prompt_dialogue(self, topic_id: int | None, task: asyncio.Task) -> None:
+        """Release a finished dialogue and make unexpected failures visible in logs."""
+        self.prompt_dialogues.pop(topic_id, None)
+        with contextlib.suppress(asyncio.CancelledError):
+            if error := task.exception():
+                logger.exception("prompt dialogue in topic %s failed", topic_id, exc_info=error)
+
+    async def _run_prompt_dialogue(self, message, topic_id: int | None) -> None:
+        """Collect model, effort, repository, and prompt from the command panel."""
+        model_command = await self.ask_question(
+            topic_id,
+            {
+                "header": "Choose a model",
+                "question": "Which model should run this task?",
+                "options": [
+                    {"label": command, "description": f"{provider.title()} · {model}"}
+                    for command, (provider, model) in MODEL_COMMANDS.items()
+                ],
+            },
+        )
+        if model_command not in MODEL_COMMANDS:
+            await self._send(topic_id, "That model is unavailable. Start Prompt again.")
+            return
+        effort_choice = await self.ask_question(
+            topic_id,
+            {
+                "header": "Reasoning effort",
+                "question": "How much reasoning effort should it use?",
+                "options": [
+                    {"label": "default", "description": "Use the model's default."},
+                    *[{"label": effort, "description": ""} for effort in EFFORT_LEVELS],
+                ],
+            },
+        )
+        if effort_choice not in {*EFFORT_LEVELS, "default"}:
+            await self._send(topic_id, "That effort level is unavailable. Start Prompt again.")
+            return
+        repo = await self._choose_repo_for_prompt(topic_id)
+        if repo is None:
+            return
+        prompt = await self._request_dialogue_text(topic_id, "✍️ Send the prompt for this task.")
+        provider, model = MODEL_COMMANDS[model_command]
+        await self._start_session(
+            message,
+            provider,
+            model,
+            None if effort_choice == "default" else effort_choice,
+            str(repo),
+            prompt.strip(),
+        )
+
+    async def _choose_repo_for_prompt(self, topic_id: int | None) -> Path | None:
+        """Search immediate repositories under the configured root, then offer matches."""
+        if self.config.repos_root is None:
+            path = await self._request_dialogue_text(
+                topic_id,
+                "✍️ URUK_REPOS_ROOT is not set. Send an absolute repository path.",
+            )
+            repo = self._resolve_repo(path.strip())
+            if repo is None:
+                await self._send(topic_id, "Not a directory. Start Prompt again.")
+            return repo
+
+        repos = sorted(
+            (path for path in self.config.repos_root.iterdir() if path.is_dir() and not path.name.startswith(".")),
+            key=lambda path: path.name.casefold(),
+        )
+        while True:
+            search = await self._request_dialogue_text(
+                topic_id,
+                "🔎 Send part of a repository name to filter it (or an absolute path).",
+            )
+            search = search.strip()
+            direct = self._resolve_repo(search)
+            if direct is not None and Path(search).is_absolute():
+                return direct
+            matches = [path for path in repos if search.casefold() in path.name.casefold()]
+            if not matches:
+                await self._send(topic_id, "No repositories match that. Try another filter.")
+                continue
+            if len(matches) > 30:
+                await self._send(topic_id, f"{len(matches)} repositories match. Please make the filter more specific.")
+                continue
+            chosen = await self.ask_question(
+                topic_id,
+                {
+                    "header": "Choose a repository",
+                    "question": f"{len(matches)} match{'es' if len(matches) != 1 else ''} for “{search}”.",
+                    "options": [
+                        {"label": path.name, "description": str(path)} for path in matches
+                    ],
+                },
+            )
+            for path in matches:
+                if path.name == chosen:
+                    return path
+            # “Other…” provides a convenient way to refine the search.
+            direct = self._resolve_repo(chosen.strip())
+            if direct is not None:
+                return direct
+            await self._send(topic_id, "That is not one of the matches. Try another filter.")
+
+    async def _request_dialogue_text(self, topic_id: int | None, text: str) -> str:
+        """Ask for one text response in a command-panel dialogue."""
+        if topic_id in self.awaiting_text:
+            raise RuntimeError(f"topic {topic_id} is already awaiting text")
+        future = asyncio.get_running_loop().create_future()
+        self.awaiting_text[topic_id] = future
+        await self._send(topic_id, text)
+        return await future
 
     async def _finalize(self, query, suffix: str) -> None:
         """Append the outcome to the prompt message and drop its buttons."""
@@ -365,6 +578,32 @@ class UrukBot:
 
     # -- commands ------------------------------------------------------------------
 
+    async def show_command_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Keep a shortcut panel in the chat's main (General) thread."""
+        if not self._auth(update):
+            return
+        message = update.effective_message
+        if not self._is_main_thread(message):
+            return
+        markup = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🎯 Prompt", callback_data="c:prompt"),
+                InlineKeyboardButton("⚡ Auto", callback_data="c:auto"),
+            ],
+            [
+                InlineKeyboardButton("🗑 Purge", callback_data="c:purge"),
+                InlineKeyboardButton("📁 Repos", callback_data="c:repos"),
+            ],
+            [
+                InlineKeyboardButton("📋 Sessions", callback_data="c:list"),
+                InlineKeyboardButton("❓ Help", callback_data="c:help"),
+            ],
+            [
+                InlineKeyboardButton("🆔 IDs", callback_data="c:id"),
+            ],
+        ])
+        await message.reply_text("Command panel", reply_markup=markup)
+
     async def cmd_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
         user = update.effective_user
@@ -382,6 +621,7 @@ class UrukBot:
             "/<fable|opus|sonnet|haiku|sol|terra|luna> [--<effort>] <repo> [task…] — start a session\n"
             "/repos — list repositories\n"
             "/list — list sessions\n"
+            "/auto [N] — offer the first N configured backlog items as new tasks (in General)\n"
             "/interrupt — interrupt the current turn (in a task topic)\n"
             "/close — end the session and close the topic (in a task topic)\n"
             "/purge — delete all topics previously closed with /close\n"
@@ -390,14 +630,203 @@ class UrukBot:
             "Any text inside a task topic goes to that session."
         )
 
-    async def cmd_new(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def cmd_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Offer configured GitHub backlog items as one-click model tasks."""
         if not self._auth(update):
             return
         message = update.effective_message
-        if not context.args:
-            await message.reply_text("Usage: /new <repo> [first prompt…]")
+        if not self._is_main_thread(message):
+            await message.reply_text("Use /auto in the General topic.")
             return
-        repo = self._resolve_repo(context.args[0])
+        args = context.args or []
+        if len(args) > 1:
+            await message.reply_text("Usage: /auto [number of items]")
+            return
+        try:
+            limit = int(args[0]) if args else AUTO_DEFAULT_LIMIT
+        except ValueError:
+            await message.reply_text("The item count must be a number.")
+            return
+        if not 1 <= limit <= AUTO_MAX_LIMIT:
+            await message.reply_text(f"Choose between 1 and {AUTO_MAX_LIMIT} items.")
+            return
+        topic_id = message.message_thread_id
+        run = self.auto_runs.get(topic_id)
+        if run is not None and not run.done():
+            await message.reply_text("An automatic backlog run is already in progress.")
+            return
+        await message.reply_text(f"📥 Fetching the first {limit} backlog item{'s' if limit != 1 else ''}…")
+        run = asyncio.create_task(self._run_auto(message, topic_id, limit))
+        self.auto_runs[topic_id] = run
+        run.add_done_callback(lambda task: self._finish_auto_run(topic_id, task))
+
+    def _finish_auto_run(self, topic_id: int | None, task: asyncio.Task) -> None:
+        """Release a completed automatic backlog run and log unexpected errors."""
+        self.auto_runs.pop(topic_id, None)
+        with contextlib.suppress(asyncio.CancelledError):
+            if error := task.exception():
+                logger.exception("automatic backlog run in topic %s failed", topic_id, exc_info=error)
+
+    async def _run_auto(self, message, topic_id: int | None, limit: int) -> None:
+        try:
+            issues = await asyncio.to_thread(self._fetch_backlog_issues, limit)
+        except RuntimeError as error:
+            await self._send(topic_id, f"⚠️ Could not fetch the backlog: {html.escape(str(error))}")
+            return
+        except Exception:
+            logger.exception("fetching the automatic backlog failed")
+            await self._send(topic_id, "⚠️ Could not fetch the backlog; see the bot logs for details.")
+            return
+
+        if not issues:
+            await self._send(topic_id, "No open backlog items were found.")
+            return
+        for issue in issues:
+            repo = self._repo_for_backlog_issue(issue)
+            if repo is None:
+                await self._send(
+                    topic_id,
+                    f"⏭ {issue.repository}#{issue.number} has no local repository named "
+                    f"{Path(issue.repository).name}; skipped.",
+                )
+                continue
+            model_command = await self._ask_auto_model(topic_id, issue)
+            if model_command is None:
+                continue
+            provider, model = MODEL_COMMANDS[model_command]
+            issue_kind = "pull request" if issue.is_pr else "issue"
+            url_part = "pull" if issue.is_pr else "issues"
+            prompt = (
+                f"Work on GitHub {issue_kind} {issue.repository}#{issue.number}: {issue.title}\n"
+                f"https://github.com/{issue.repository}/{url_part}/{issue.number}"
+            )
+            await self._start_session(message, provider, model, None, str(repo), prompt)
+
+    @staticmethod
+    def _fetch_backlog_issues(limit: int) -> list[Issue]:
+        """Load and sort the configured backlog using the current GitHub CLI login."""
+        try:
+            token_result = subprocess.run(
+                ["gh", "auth", "token"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as error:
+            raise RuntimeError("GitHub CLI is not installed.") from error
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError("GitHub CLI is not authenticated; run `gh auth login`.") from error
+        token = token_result.stdout.strip()
+        if not token:
+            raise RuntimeError("GitHub CLI did not return a token; run `gh auth login`.")
+
+        config = InsidersConfig.from_default_location()
+        if isinstance(config.backlog_namespaces, InsidersUnset):
+            raise RuntimeError("Configure [backlog].namespaces in ~/.config/insiders/insiders.toml.")
+        issue_labels = (
+            set(config.backlog_issue_labels)
+            if isinstance(config.backlog_issue_labels, dict)
+            else None
+        )
+        # Passing the token directly is equivalent to setting GITHUB_TOKEN for
+        # insiders, but keeps the secret out of this process-wide environment.
+        with GitHub(token) as github:
+            backlog = get_backlog(
+                config.backlog_namespaces,
+                github=github,
+                issue_labels=issue_labels,
+            )
+        if not isinstance(config.backlog_sort, InsidersUnset):
+            backlog.sort(*config.backlog_sort)
+        return backlog.issues[:limit]
+
+    def _repo_for_backlog_issue(self, issue: Issue) -> Path | None:
+        """Map GitHub owner/repository names to same-named local repositories."""
+        return self._resolve_repo(Path(issue.repository).name)
+
+    async def _ask_auto_model(self, topic_id: int | None, issue: Issue) -> str | None:
+        """Ask which model, if any, should start the current backlog issue."""
+        pid = next(self._pid)
+        pending = Pending(
+            kind="auto",
+            future=asyncio.get_running_loop().create_future(),
+            topic_id=topic_id,
+        )
+        self.pending[pid] = pending
+        url_part = "pull" if issue.is_pr else "issues"
+        url = f"https://github.com/{issue.repository}/{url_part}/{issue.number}"
+        text = (
+            f"📥 <b>{html.escape(issue.repository)}#{issue.number}</b>\n"
+            f"<a href=\"{url}\">{html.escape(issue.title)}</a>\n\n"
+            "Start a task for this item? Choose a model, or skip it."
+        )
+        await self._send(
+            topic_id,
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=self._auto_model_markup(pid),
+        )
+        return await pending.future
+
+    @staticmethod
+    def _auto_model_markup(pid: int) -> InlineKeyboardMarkup:
+        buttons = [
+            InlineKeyboardButton(command, callback_data=f"a:{pid}:{command}")
+            for command in MODEL_COMMANDS
+        ]
+        rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+        rows.append([InlineKeyboardButton("⏭ Skip", callback_data=f"a:{pid}:skip")])
+        return InlineKeyboardMarkup(rows)
+
+    async def cmd_new_deprecated(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        await update.effective_message.reply_text(
+            "Use /<fable|opus|sonnet|haiku|sol|terra|luna> "
+            "[--low|--medium|--high|--xhigh|--max] "
+            "<repo> [first prompt…].\n"
+            "For example: /fable --max myrepo Fix the failing tests"
+        )
+
+    async def cmd_new_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        message = update.effective_message
+        command, *args = message.text.split()
+        model_command, separator, username = command.removeprefix("/").partition("@")
+        if separator and username.lower() != context.bot.username.lower():
+            return
+        model_command = model_command.lower()
+        provider, model = MODEL_COMMANDS[model_command]
+        effort = None
+        effort_flag = parse_effort_flag(args[0]) if args else None
+        if effort_flag is not None:
+            args.pop(0)
+            effort = effort_flag
+            if effort not in EFFORT_LEVELS:
+                choices = "|".join(f"--{value}" for value in EFFORT_LEVELS)
+                await message.reply_text(f"Unknown effort flag. Choose one of: {choices}.")
+                return
+        if not args:
+            await message.reply_text(
+                f"Usage: /{model_command} [--low|--medium|--high|--xhigh|--max] "
+                "<repo> [first prompt…]"
+            )
+            return
+        prompt = " ".join(args[1:]).strip()
+        await self._start_session(message, provider, model, effort, args[0], prompt)
+
+    async def _start_session(
+        self,
+        message,
+        provider: str,
+        model: str,
+        effort: str | None,
+        repo_argument: str,
+        prompt: str,
+    ) -> None:
+        """Create a task topic from either a slash command or the prompt dialogue."""
+        repo = self._resolve_repo(repo_argument)
         if repo is None:
             hint = " Use /repos to list them." if self.config.repos_root else ""
             await message.reply_text(f"Not a directory: {repo_argument}.{hint}")
@@ -510,6 +939,7 @@ class UrukBot:
         try:
             message = await self.app.bot.send_message(
                 chat_id=self.config.chat_id,
+                text=self._status_text(info),
                 message_thread_id=info.topic_id,
             )
         except TelegramError:

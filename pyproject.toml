@@ -1,11 +1,12 @@
 [project]
 name = "uruk"
 version = "0.1.0"
-description = "Telegram bot to drive Claude Code agent sessions across repositories from your phone."
+description = "Telegram bot to drive Claude Code and OpenAI Codex sessions from your phone."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk>=0.1",
+    "insiders",
     "openai-codex>=0.144.4",
     "python-telegram-bot>=21.0",
     "telegramify-markdown>=1.2.0",

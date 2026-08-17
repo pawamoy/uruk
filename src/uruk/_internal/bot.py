@@ -122,6 +122,9 @@ class UrukBot:
         self.awaiting_text: dict[int | None, asyncio.Future] = {}
         self.prompt_dialogues: dict[int | None, asyncio.Task] = {}
         self.auto_runs: dict[int | None, asyncio.Task] = {}
+        self.backlog: list[Issue] = []  # Fetched once, in memory, until a full review cycle ends.
+        self.backlog_started: set[str] = set()
+        self.backlog_skipped: set[str] = set()
         self._pid = itertools.count(1)
         self.app: Application | None = None
 
@@ -642,7 +645,8 @@ class UrukBot:
             "/<fable|opus|sonnet|haiku|sol|terra|luna> [--<effort>] <repo> [task…] — start a session\n"
             "/repos — list repositories\n"
             "/list — list sessions\n"
-            "/auto [N] — offer the first N configured backlog items as new tasks (in General)\n"
+            "/auto [N] — offer the next N unreviewed backlog items as new tasks (in General); "
+            "the backlog is fetched once and cycles when fully reviewed\n"
             "/interrupt — interrupt the current turn (in a task topic)\n"
             "/close — end the session and close the topic (in a task topic)\n"
             "/purge — delete topics closed with /close, and forget sessions whose topics were deleted by hand\n"
@@ -676,7 +680,6 @@ class UrukBot:
         if run is not None and not run.done():
             await message.reply_text("An automatic backlog run is already in progress.")
             return
-        await message.reply_text(f"📥 Fetching the first {limit} backlog item{'s' if limit != 1 else ''}…")
         run = asyncio.create_task(self._run_auto(message, topic_id, limit))
         self.auto_runs[topic_id] = run
         run.add_done_callback(lambda task: self._finish_auto_run(topic_id, task))
@@ -693,7 +696,7 @@ class UrukBot:
 
     async def _run_auto(self, message, topic_id: int | None, limit: int) -> None:
         try:
-            issues = await asyncio.to_thread(self._fetch_backlog_issues, limit)
+            issues = await self._next_backlog_items(topic_id, limit)
         except RuntimeError as error:
             await self._send(topic_id, f"⚠️ Could not fetch the backlog: {html.escape(str(error))}")
             return
@@ -706,8 +709,10 @@ class UrukBot:
             await self._send(topic_id, "No open backlog items were found.")
             return
         for issue in issues:
+            key = self._issue_key(issue)
             repo = self._repo_for_backlog_issue(issue)
             if repo is None:
+                self.backlog_skipped.add(key)
                 await self._send(
                     topic_id,
                     f"⏭ {issue.repository}#{issue.number} has no local repository named "
@@ -716,7 +721,9 @@ class UrukBot:
                 continue
             model_command = await self._ask_auto_model(topic_id, issue)
             if model_command is None:
+                self.backlog_skipped.add(key)
                 continue
+            self.backlog_started.add(key)
             provider, model = MODEL_COMMANDS[model_command]
             issue_kind = "pull request" if issue.is_pr else "issue"
             url_part = "pull" if issue.is_pr else "issues"
@@ -725,9 +732,36 @@ class UrukBot:
                 f"https://github.com/{issue.repository}/{url_part}/{issue.number}"
             )
             await self._start_session(message, provider, model, None, str(repo), prompt)
+        reviewed = self.backlog_started | self.backlog_skipped
+        if all(self._issue_key(issue) in reviewed for issue in self.backlog):
+            await self._send(
+                topic_id,
+                "🏁 Every backlog item has been reviewed; the next /auto fetches a fresh list and starts over.",
+            )
+
+    async def _next_backlog_items(self, topic_id: int | None, limit: int) -> list[Issue]:
+        """The next unreviewed items from the cached backlog, fetching the full list when needed."""
+        reviewed = self.backlog_started | self.backlog_skipped
+        remaining = [issue for issue in self.backlog if self._issue_key(issue) not in reviewed]
+        if not remaining:
+            await self._send(
+                topic_id,
+                "🔁 Starting a new cycle: fetching the complete backlog…"
+                if self.backlog
+                else "📥 Fetching the complete backlog…",
+            )
+            self.backlog = await asyncio.to_thread(self._fetch_backlog_issues)
+            self.backlog_started.clear()
+            self.backlog_skipped.clear()
+            remaining = list(self.backlog)
+        return remaining[:limit]
 
     @staticmethod
-    def _fetch_backlog_issues(limit: int) -> list[Issue]:
+    def _issue_key(issue: Issue) -> str:
+        return f"{issue.repository}#{issue.number}"
+
+    @staticmethod
+    def _fetch_backlog_issues() -> list[Issue]:
         """Load and sort the configured backlog using the current GitHub CLI login."""
         try:
             token_result = subprocess.run(
@@ -765,7 +799,7 @@ class UrukBot:
             )
         if not isinstance(config.backlog_sort, InsidersUnset):
             backlog.sort(*config.backlog_sort)
-        return backlog.issues[:limit]
+        return backlog.issues
 
     def _repo_for_backlog_issue(self, issue: Issue) -> Path | None:
         """Map GitHub owner/repository names to same-named local repositories."""

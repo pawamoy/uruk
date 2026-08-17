@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
+import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import TelegramError
@@ -754,6 +755,9 @@ class UrukBot:
         # Passing the token directly is equivalent to setting GITHUB_TOKEN for
         # insiders, but keeps the secret out of this process-wide environment.
         with GitHub(token) as github:
+            # GitHub's GraphQL search regularly needs more than httpx's default
+            # 5-second read timeout when paginating a large backlog.
+            github.http_client.timeout = httpx.Timeout(60.0)
             backlog = get_backlog(
                 config.backlog_namespaces,
                 github=github,

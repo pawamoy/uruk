@@ -400,11 +400,17 @@ class UrukBot:
         repo = self._resolve_repo(context.args[0])
         if repo is None:
             hint = " Use /repos to list them." if self.config.repos_root else ""
-            await message.reply_text(f"Not a directory: {context.args[0]}.{hint}")
+            await message.reply_text(f"Not a directory: {repo_argument}.{hint}")
             return
-        prompt = " ".join(context.args[1:]).strip()
         title = prompt[:60] if prompt else "interactive session"
-        info = TaskInfo(topic_id=0, repo=str(repo), title=title)
+        info = TaskInfo(
+            topic_id=0,
+            repo=str(repo),
+            title=title,
+            provider=provider,
+            model=model,
+            effort=effort,
+        )
         try:
             topic = await self.app.bot.create_forum_topic(
                 chat_id=self.config.chat_id,
@@ -420,7 +426,7 @@ class UrukBot:
         self.store.set(info)
         task = self._make_task(info)
         self.tasks[info.topic_id] = task
-        await self._send(info.topic_id, f"📂 Session in {repo} (mode: {self.config.permission_mode}).")
+        await self._pin_status(info)
         if prompt:
             await self._send(info.topic_id, f"🎯 {prompt}")
             await task.submit(prompt)
@@ -485,22 +491,78 @@ class UrukBot:
         return task
 
     def _topic_name(self, info: TaskInfo) -> str:
-        """Topic name showing the repo, title, and current model/effort (128-char Telegram cap)."""
-        model = info.model or self.config.model or "default"
-        suffix = f" [{model} · {info.effort or 'default'}]"
-        base = f"{Path(info.repo).name} · {info.title}"
-        return f"{base[: 96 - len(suffix)]}{suffix}"
+        """Topic name showing the repo and title (Telegram caps names at 128 chars)."""
+        return f"{Path(info.repo).name} · {info.title}"[:96]
 
-    async def _rename_topic(self, info: TaskInfo) -> None:
-        """Push the current topic name (model/effort included) to Telegram."""
+    def _status_text(self, info: TaskInfo) -> str:
+        """The compact status message: current model and effort."""
+        # The init message of a session reports the actually-resolved model; before the
+        # first one arrives, fall back to whatever was requested.
+        model = info.resolved_model or info.model
+        if model is None and info.provider == "claude":
+            model = self.config.model
+        model = MODEL_LABELS.get(model, model or "resolving…")
+        effort = info.effort or ("default" if info.provider == "openai" else "high")
+        return f"{model}: {effort}"
+
+    async def _pin_status(self, info: TaskInfo) -> None:
+        """Send the status message, force a pin transition, and remember its ID."""
         try:
-            await self.app.bot.edit_forum_topic(
+            message = await self.app.bot.send_message(
                 chat_id=self.config.chat_id,
                 message_thread_id=info.topic_id,
-                name=self._topic_name(info),
             )
         except TelegramError:
-            logger.warning("failed to rename topic %s", info.topic_id, exc_info=True)
+            logger.warning("failed to send status message to topic %s", info.topic_id, exc_info=True)
+            return
+        info.status_message_id = message.message_id
+        self.store.save()
+        try:
+            await self.app.bot.unpin_chat_message(
+                chat_id=self.config.chat_id,
+                message_id=message.message_id,
+            )
+        except Exception as error:
+            logger.exception(
+                "failed to unpin status message %s in topic %s before pinning: %s",
+                message.message_id,
+                info.topic_id,
+                error,
+            )
+        try:
+            await self.app.bot.pin_chat_message(
+                chat_id=self.config.chat_id,
+                message_id=message.message_id,
+                disable_notification=True,
+            )
+        except Exception as error:
+            logger.exception(
+                "failed to pin status message %s in topic %s: %s",
+                message.message_id,
+                info.topic_id,
+                error,
+            )
+
+    async def refresh_status(self, topic_id: int) -> None:
+        """UI-protocol hook: an agent session learned its actual model; refresh its status."""
+        info = self.store.get(topic_id)
+        if info is not None:
+            await self._update_status(info)
+
+    async def _update_status(self, info: TaskInfo) -> None:
+        """Refresh the status message (creating it for topics that predate it)."""
+        if info.status_message_id is None:
+            await self._pin_status(info)
+            return
+        try:
+            await self.app.bot.edit_message_text(
+                chat_id=self.config.chat_id,
+                message_id=info.status_message_id,
+                text=self._status_text(info),
+            )
+        except TelegramError as error:
+            if "not modified" not in str(error).lower():
+                logger.warning("failed to update status message for topic %s", info.topic_id, exc_info=True)
 
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update):

@@ -16,17 +16,10 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-"""Entry-point module, in case you use `python -m uruk`.
+"""Tests suite for `uruk`."""
 
-Why does this file exist, and why `__main__`? For more info, read:
+from pathlib import Path
 
-- https://www.python.org/dev/peps/pep-0338/
-- https://docs.python.org/3/using/cmdline.html#cmdoption-m
-"""
-
-import sys
-
-from uruk._internal.cli import main
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+TESTS_DIR = Path(__file__).parent
+TMP_DIR = TESTS_DIR / "tmp"
+FIXTURES_DIR = TESTS_DIR / "fixtures"

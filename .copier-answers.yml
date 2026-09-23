@@ -1,0 +1,18 @@
+# Changes here will be overwritten by Copier.
+_commit: 1.14.0
+_src_path: gh:pawamoy/copier-uv
+author_email: dev@pawamoy.fr
+author_fullname: Timothée Mazzucotelli
+author_username: pawamoy
+copyright_date: '2026'
+copyright_holder: Timothée Mazzucotelli
+copyright_holder_email: dev@pawamoy.fr
+copyright_license: ISC
+project_description: Telegram bot to drive Claude Code and OpenAI Codex sessions from your phone.
+project_name: Uruk
+python_package_command_line_name: uruk
+python_package_distribution_name: uruk
+python_package_import_name: uruk
+repository_name: uruk
+repository_namespace: pawamoy
+repository_provider: github.com

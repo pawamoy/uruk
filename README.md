@@ -1,7 +1,26 @@
 # Uruk
 
+[![ci](https://github.com/pawamoy/uruk/workflows/ci/badge.svg)](https://github.com/pawamoy/uruk/actions?query=workflow%3Aci)
+[![documentation](https://img.shields.io/badge/docs-zensical-FF9100.svg?style=flat)](https://pawamoy.github.io/uruk/)
+[![pypi version](https://img.shields.io/pypi/v/uruk.svg)](https://pypi.org/project/uruk/)
+[![gitter](https://img.shields.io/badge/matrix-chat-4DB798.svg?style=flat)](https://app.gitter.im/#/room/#uruk:gitter.im)
+
+Telegram bot to drive Claude Code and OpenAI Codex sessions from your phone.
+
 Control [Claude Code](https://claude.com/claude-code) and
 [OpenAI Codex](https://developers.openai.com/codex/) agent sessions from your phone, through Telegram.
+
+## Installation
+
+```bash
+pip install uruk
+```
+
+With [`uv`](https://docs.astral.sh/uv/):
+
+```bash
+uv tool install uruk
+```
 
 Uruk runs on your dev machine and drives one Claude Agent SDK or OpenAI Codex SDK session per
 task, each in its own repository and its own Telegram **forum topic**. Agent output streams into
@@ -124,3 +143,8 @@ This bot is, by design, remote code execution on your machine. Accordingly:
 - Keep the bot token secret — anyone with the token *and* control of your Telegram account owns
   the machine.
 - Don't set `URUK_PERMISSION_MODE=bypassPermissions` unless you fully trust every task you run.
+
+## Sponsors
+
+<!-- sponsors-start -->
+<!-- sponsors-end -->

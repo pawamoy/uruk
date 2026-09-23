@@ -113,10 +113,13 @@ def resume_main() -> None:
         raise SystemExit(f"uruk resume: {response.get('error', 'could not release session')}")
 
     os.chdir(info.repo)
+    session_id = info.session_id
+    if session_id is None:
+        raise SystemExit("uruk resume: session has no ID")
     if info.provider == "claude":
-        os.execvp("claude", ["claude", "--resume", info.session_id])  # noqa: S606,S607
+        os.execvp("claude", ["claude", "--resume", session_id])  # noqa: S606,S607
     if info.provider == "openai":
-        os.execvp("codex", ["codex", "resume", info.session_id])  # noqa: S606,S607
+        os.execvp("codex", ["codex", "resume", session_id])  # noqa: S606,S607
     raise SystemExit(f"uruk resume: unsupported provider {info.provider!r}")
 
 

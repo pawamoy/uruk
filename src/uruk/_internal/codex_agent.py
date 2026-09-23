@@ -144,15 +144,20 @@ class CodexAgentTask:
             self.turn_running = False
 
     async def _open_thread(self, codex: AsyncCodex) -> AsyncThread:
-        options = {
-            "approval_mode": ApprovalMode.auto_review,
-            "cwd": self.info.repo,
-            "model": self.info.model,
-            "sandbox": Sandbox.workspace_write,
-        }
         if self.info.session_id:
-            return await codex.thread_resume(self.info.session_id, **options)
-        return await codex.thread_start(**options)
+            return await codex.thread_resume(
+                self.info.session_id,
+                approval_mode=ApprovalMode.auto_review,
+                cwd=self.info.repo,
+                model=self.info.model,
+                sandbox=Sandbox.workspace_write,
+            )
+        return await codex.thread_start(
+            approval_mode=ApprovalMode.auto_review,
+            cwd=self.info.repo,
+            model=self.info.model,
+            sandbox=Sandbox.workspace_write,
+        )
 
     def _effort(self) -> ReasoningEffort | None:
         return ReasoningEffort(self.info.effort) if self.info.effort else None

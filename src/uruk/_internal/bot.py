@@ -41,7 +41,7 @@ from insiders import GitHub, Issue, get_backlog
 from insiders import Unset as InsidersUnset
 from loguru import logger
 from openai_codex import AsyncCodex, CodexConfig
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
+from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -53,7 +53,7 @@ from telegram.ext import (
     filters,
 )
 from telegramify_markdown import telegramify
-from telegramify_markdown.content import ContentType, File, Photo, Text
+from telegramify_markdown.content import File, Photo, Text
 
 from uruk._internal.agent import AgentTask, ClaudeAgentTask, summarize_tool_input
 from uruk._internal.codex_agent import CodexAgentTask
@@ -188,6 +188,12 @@ class UrukBot:
         # command handlers so the panel follows each command's response.
         app.add_handler(MessageHandler(filters.COMMAND, self.show_command_panel), group=1)
 
+    def _application(self) -> Application:
+        """Return the Telegram application after it has been attached."""
+        if self.app is None:
+            raise RuntimeError("Telegram application is not attached")
+        return self.app
+
     async def shutdown(self, app: Application) -> None:  # noqa: ARG002
         for dialogue in self.prompt_dialogues.values():
             dialogue.cancel()
@@ -291,7 +297,23 @@ class UrukBot:
         )
 
     @staticmethod
-    def _is_main_thread(message: Any) -> bool:
+    def _message(update: Update) -> Message:
+        """Return the message supplied to a message or command handler."""
+        message = update.effective_message
+        if message is None:
+            raise ValueError("update has no message")
+        return message
+
+    @staticmethod
+    def _query(update: Update) -> CallbackQuery:
+        """Return the query supplied to a callback query handler."""
+        query = update.callback_query
+        if query is None:
+            raise ValueError("update has no callback query")
+        return query
+
+    @staticmethod
+    def _is_main_thread(message: Message) -> bool:
         """Whether a message is in a chat's main/General thread.
 
         Telegram identifies the General forum topic as thread 1. Non-forum chats
@@ -345,15 +367,15 @@ class UrukBot:
                     await self._send(topic_id, box.text)
 
     async def _send_box(self, topic_id: int, box: Text | File | Photo) -> None:
-        if box.content_type == ContentType.TEXT:
-            await self.app.bot.send_message(
+        if isinstance(box, Text):
+            await self._application().bot.send_message(
                 chat_id=self.config.chat_id,
                 text=box.text,
                 entities=to_entities(box.entities),
                 message_thread_id=topic_id,
             )
-        elif box.content_type == ContentType.FILE:
-            await self.app.bot.send_document(
+        elif isinstance(box, File):
+            await self._application().bot.send_document(
                 chat_id=self.config.chat_id,
                 document=box.file_data,
                 filename=box.file_name,
@@ -361,8 +383,8 @@ class UrukBot:
                 caption_entities=to_entities(box.caption_entities),
                 message_thread_id=topic_id,
             )
-        else:  # ContentType.PHOTO (e.g. rendered mermaid diagrams)
-            await self.app.bot.send_photo(
+        else:  # Photo (e.g. rendered mermaid diagrams)
+            await self._application().bot.send_photo(
                 chat_id=self.config.chat_id,
                 photo=box.file_data,
                 caption=box.caption_text or None,
@@ -374,7 +396,7 @@ class UrukBot:
         await self._send(topic_id, f"<i>{html.escape(text)}</i>", parse_mode=ParseMode.HTML)
 
     async def send_typing(self, topic_id: int) -> None:
-        await self.app.bot.send_chat_action(
+        await self._application().bot.send_chat_action(
             chat_id=self.config.chat_id,
             action=ChatAction.TYPING,
             message_thread_id=topic_id,
@@ -399,7 +421,7 @@ class UrukBot:
         await self._send(topic_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
         return await pending.future
 
-    async def ask_question(self, topic_id: int, question: dict) -> str:
+    async def ask_question(self, topic_id: int | None, question: dict) -> str:
         pid = next(self._pid)
         options = [option["label"] for option in question.get("options", [])]
         pending = Pending(
@@ -439,7 +461,7 @@ class UrukBot:
 
     async def _send(self, topic_id: int | None, text: str, **kwargs: Any) -> None:
         try:
-            await self.app.bot.send_message(
+            await self._application().bot.send_message(
                 chat_id=self.config.chat_id,
                 text=text,
                 message_thread_id=topic_id,
@@ -451,9 +473,12 @@ class UrukBot:
     # -- button presses ------------------------------------------------------------
 
     async def on_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
+        query = self._query(update)
         if not self._authorized(query.from_user.id, query.message.chat.id if query.message else None):
             await query.answer()
+            return
+        if not isinstance(query.data, str):
+            await query.answer("Unknown action.")
             return
         if query.data.startswith("c:"):
             await self._handle_command_button(update, context)
@@ -461,7 +486,7 @@ class UrukBot:
         try:
             kind, pid_str, arg = query.data.split(":", 2)
             pid = int(pid_str)
-        except (AttributeError, ValueError):
+        except ValueError:
             await query.answer("Unknown action.")
             return
         pending = self.pending.get(pid)
@@ -532,10 +557,13 @@ class UrukBot:
 
     async def _handle_command_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Dispatch a shortcut from the persistent command panel."""
-        query = update.callback_query
+        query = self._query(update)
         message = query.message
-        if message is None or not self._is_main_thread(message):
+        if not isinstance(message, Message) or not self._is_main_thread(message):
             await query.answer("Use the command panel in General.")
+            return
+        if not isinstance(query.data, str):
+            await query.answer("Unknown action.")
             return
         command = query.data.removeprefix("c:")
         handlers = {
@@ -691,8 +719,10 @@ class UrukBot:
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
         if not self._auth(update):
             return
-        message = update.effective_message
+        message = self._message(update)
         topic_id = message.message_thread_id
+        if message.text is None:
+            return
 
         if topic_id in self.awaiting_text:
             future = self.awaiting_text.pop(topic_id)
@@ -729,7 +759,7 @@ class UrukBot:
         """Keep a shortcut panel in the chat's main (General) thread."""
         if not self._auth(update):
             return
-        message = update.effective_message
+        message = self._message(update)
         if not self._is_main_thread(message):
             return
         await self._maybe_show_panel(message.message_thread_id)
@@ -769,7 +799,9 @@ class UrukBot:
     async def cmd_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
         chat = update.effective_chat
         user = update.effective_user
-        await update.effective_message.reply_text(
+        if chat is None or user is None:
+            return
+        await self._message(update).reply_text(
             f"chat_id: {chat.id}\n"
             f"user_id: {user.id}\n"
             f"chat type: {chat.type}\n"
@@ -779,7 +811,7 @@ class UrukBot:
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
         if not self._auth(update):
             return
-        await update.effective_message.reply_text(
+        await self._message(update).reply_text(
             "/<fable|opus|sonnet|haiku|sol|terra|luna> [--<effort>] <repo> [task…] — start a session\n"
             "/repos — list repositories\n"
             "/list — list sessions\n"
@@ -799,7 +831,7 @@ class UrukBot:
         """Offer configured GitHub backlog items as one-click model tasks."""
         if not self._auth(update):
             return
-        message = update.effective_message
+        message = self._message(update)
         if not self._is_main_thread(message):
             await message.reply_text("Use /auto in the General topic.")
             return
@@ -990,7 +1022,7 @@ class UrukBot:
     async def cmd_new_deprecated(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
         if not self._auth(update):
             return
-        await update.effective_message.reply_text(
+        await self._message(update).reply_text(
             "Use /<fable|opus|sonnet|haiku|sol|terra|luna> "
             "[--low|--medium|--high|--xhigh|--max] "
             "<repo> [first prompt…].\n"
@@ -1000,7 +1032,9 @@ class UrukBot:
     async def cmd_new_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update):
             return
-        message = update.effective_message
+        message = self._message(update)
+        if message.text is None:
+            return
         command, *args = message.text.split()
         model_command, separator, username = command.removeprefix("/").partition("@")
         if separator and username.lower() != context.bot.username.lower():
@@ -1049,7 +1083,7 @@ class UrukBot:
             effort=effort,
         )
         try:
-            topic = await self.app.bot.create_forum_topic(
+            topic = await self._application().bot.create_forum_topic(
                 chat_id=self.config.chat_id,
                 name=self._topic_name(info),
             )
@@ -1081,7 +1115,7 @@ class UrukBot:
         if not self._auth(update):
             return
         if self.config.repos_root is None:
-            await update.effective_message.reply_text(
+            await self._message(update).reply_text(
                 "URUK_REPOS_ROOT is not set; use an absolute path with your model command.",
             )
             return
@@ -1090,7 +1124,7 @@ class UrukBot:
         )
         text = "\n".join(names) or "(empty)"
         for part in chunk(text):
-            await update.effective_message.reply_text(part)
+            await self._message(update).reply_text(part)
 
     async def cmd_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
         if not self._auth(update):
@@ -1109,13 +1143,13 @@ class UrukBot:
             else:
                 status = "💤 resumable"
             lines.append(f"{status} — {Path(info.repo).name} — {info.title}")
-        await update.effective_message.reply_text("\n".join(lines) or "No sessions.")
+        await self._message(update).reply_text("\n".join(lines) or "No sessions.")
 
     async def cmd_attach(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
         """Offer local Claude and Codex sessions to take over in Telegram."""
         if not self._auth(update):
             return
-        message = update.effective_message
+        message = self._message(update)
         if not self._is_main_thread(message):
             await message.reply_text("Use /attach in the General topic.")
             return
@@ -1266,7 +1300,7 @@ class UrukBot:
             owner="telegram",
         )
         try:
-            topic = await self.app.bot.create_forum_topic(
+            topic = await self._application().bot.create_forum_topic(
                 chat_id=self.config.chat_id,
                 name=self._topic_name(info),
             )
@@ -1288,7 +1322,7 @@ class UrukBot:
         """Release a topic so its provider session can be resumed in a terminal."""
         if not self._auth(update):
             return
-        message = update.effective_message
+        message = self._message(update)
         topic_id = message.message_thread_id
         if topic_id is None or self.store.get(topic_id) is None:
             await message.reply_text("Use /release inside a task topic.")
@@ -1312,7 +1346,7 @@ class UrukBot:
     async def cmd_interrupt(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
         if not self._auth(update):
             return
-        message = update.effective_message
+        message = self._message(update)
         topic_id = message.message_thread_id
         task = self.tasks.get(topic_id) if topic_id is not None else None
         if task is None:
@@ -1324,7 +1358,7 @@ class UrukBot:
 
     def _topic_task(self, update: Update) -> AgentTask | None:
         """The task for the topic this command was sent in, or None (with a hint sent)."""
-        topic_id = update.effective_message.message_thread_id
+        topic_id = self._message(update).message_thread_id
         return self._get_task(topic_id) if topic_id is not None else None
 
     def _topic_name(self, info: TaskInfo) -> str:
@@ -1345,7 +1379,7 @@ class UrukBot:
     async def _pin_status(self, info: TaskInfo) -> None:
         """Send the status message, force a pin transition, and remember its ID."""
         try:
-            message = await self.app.bot.send_message(
+            message = await self._application().bot.send_message(
                 chat_id=self.config.chat_id,
                 text=self._status_text(info),
                 message_thread_id=info.topic_id,
@@ -1356,7 +1390,7 @@ class UrukBot:
         info.status_message_id = message.message_id
         self.store.save()
         try:
-            await self.app.bot.unpin_chat_message(
+            await self._application().bot.unpin_chat_message(
                 chat_id=self.config.chat_id,
                 message_id=message.message_id,
             )
@@ -1367,7 +1401,7 @@ class UrukBot:
                 info.topic_id,
             )
         try:
-            await self.app.bot.pin_chat_message(
+            await self._application().bot.pin_chat_message(
                 chat_id=self.config.chat_id,
                 message_id=message.message_id,
                 disable_notification=True,
@@ -1391,7 +1425,7 @@ class UrukBot:
             await self._pin_status(info)
             return
         try:
-            await self.app.bot.edit_message_text(
+            await self._application().bot.edit_message_text(
                 chat_id=self.config.chat_id,
                 message_id=info.status_message_id,
                 text=self._status_text(info),
@@ -1403,7 +1437,7 @@ class UrukBot:
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update):
             return
-        message = update.effective_message
+        message = self._message(update)
         task = self._topic_task(update)
         if task is None:
             await message.reply_text("Use /model inside a task topic.")
@@ -1440,7 +1474,7 @@ class UrukBot:
     async def cmd_effort(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update):
             return
-        message = update.effective_message
+        message = self._message(update)
         task = self._topic_task(update)
         if task is None:
             await message.reply_text("Use /effort inside a task topic.")
@@ -1475,7 +1509,7 @@ class UrukBot:
     async def cmd_close(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
         if not self._auth(update):
             return
-        message = update.effective_message
+        message = self._message(update)
         topic_id = message.message_thread_id
         if topic_id is None or self.store.get(topic_id) is None:
             await message.reply_text("Use /close inside a task topic.")
@@ -1487,17 +1521,17 @@ class UrukBot:
         self.awaiting_text.pop(topic_id, None)
         await message.reply_text("Closed.")
         with contextlib.suppress(TelegramError):
-            await self.app.bot.close_forum_topic(chat_id=self.config.chat_id, message_thread_id=topic_id)
+            await self._application().bot.close_forum_topic(chat_id=self.config.chat_id, message_thread_id=topic_id)
         self.store.add_closed(topic_id)
 
     async def cmd_purge(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
         if not self._auth(update):
             return
-        message = update.effective_message
+        message = self._message(update)
         deleted, failed = 0, 0
         for topic_id in self.store.closed():
             try:
-                await self.app.bot.delete_forum_topic(chat_id=self.config.chat_id, message_thread_id=topic_id)
+                await self._application().bot.delete_forum_topic(chat_id=self.config.chat_id, message_thread_id=topic_id)
             except TelegramError as error:  # noqa: PERF203
                 if "not found" in str(error).lower():  # Already deleted by hand: stop tracking it.
                     self.store.remove_closed(topic_id)
@@ -1530,7 +1564,7 @@ class UrukBot:
         orphaned = 0
         for info in self.store.all():
             try:
-                await self.app.bot.send_chat_action(
+                await self._application().bot.send_chat_action(
                     chat_id=self.config.chat_id,
                     action=ChatAction.TYPING,
                     message_thread_id=info.topic_id,

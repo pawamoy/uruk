@@ -167,10 +167,10 @@ class ClaudeAgentTask:
     async def _run(self) -> None:
         options = ClaudeAgentOptions(
             cwd=self.info.repo,
-            permission_mode=self.permission_mode,
+            permission_mode=self.permission_mode,  # ty: ignore[invalid-argument-type]
             can_use_tool=self._on_permission,
             model=self.info.model or self.default_model,
-            effort=self.info.effort,
+            effort=self.info.effort,  # ty: ignore[invalid-argument-type]
             resume=self.info.session_id,
             setting_sources=["user", "project", "local"],
         )

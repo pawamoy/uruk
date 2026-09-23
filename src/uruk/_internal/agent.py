@@ -1,18 +1,33 @@
-"""Shared agent interface and the Claude Agent SDK implementation.
+# SPDX-License-Identifier: ISC
+#
+# ISC License
+#
+# Copyright (c) 2026, Timothée Mazzucotelli and contributors
+#
+# Permission to use, copy, modify, and/or distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-Each task owns one SDK session pinned to a repository, is fed by a queue of user
-prompts, and reports everything through a `UI` object.
-"""
+# Shared agent interface and the Claude Agent SDK implementation.
+#
+# Each task owns one SDK session pinned to a repository, is fed by a queue of user
+# prompts, and reports everything through a `UI` object.
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import json
-from collections.abc import Callable
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from loguru import logger
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -25,8 +40,12 @@ from claude_agent_sdk import (
     ToolPermissionContext,
     ToolUseBlock,
 )
+from loguru import logger
 
-from uruk._internal.store import TaskInfo
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from uruk._internal.store import TaskInfo
 
 # Tools whose (auto-approved) use is worth a one-line notice in the topic.
 # Reads and searches stay silent; anything that needs approval shows up as a prompt anyway.
@@ -119,8 +138,11 @@ class ClaudeAgentTask:
             self._worker = None
 
     async def set_model(self, model: str | None) -> bool:
-        """Change the model. Returns whether it was applied to a live session
-        (otherwise it takes effect when the session next starts)."""
+        """Change the model.
+
+        Returns whether it was applied to a live session
+        (otherwise it takes effect when the session next starts).
+        """
         self.info.model = model
         # The old resolved model is stale now; the next session init reports the new one.
         self.info.resolved_model = None
@@ -131,9 +153,12 @@ class ClaudeAgentTask:
         return False
 
     async def set_effort(self, effort: str | None) -> None:
-        """Change the effort level. The SDK has no runtime setter for effort, so the
+        """Change the effort level.
+
+        The SDK has no runtime setter for effort, so the
         session is stopped; the next message restarts it (resuming the conversation)
-        with the new value."""
+        with the new value.
+        """
         self.info.effort = effort
         self.on_state_change()
         if self.active:
@@ -165,7 +190,7 @@ class ClaudeAgentTask:
                         self.turn_running = False
         except asyncio.CancelledError:
             raise
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001
             logger.exception("session for topic {} crashed", self.info.topic_id)
             with contextlib.suppress(Exception):
                 await self.ui.send_text(
@@ -211,7 +236,7 @@ class ClaudeAgentTask:
         self,
         tool_name: str,
         input_data: dict[str, Any],
-        context: ToolPermissionContext,
+        context: ToolPermissionContext,  # noqa: ARG002
     ) -> PermissionResultAllow | PermissionResultDeny:
         # The agent's clarifying questions route through the same permission channel.
         if tool_name == "AskUserQuestion":

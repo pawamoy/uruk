@@ -35,14 +35,12 @@ import json
 import os
 import sys
 from pathlib import Path
-import sys
 from typing import Any
 
+from uruk._internal import debug
 from uruk._internal.bot import main as run_bot
 from uruk._internal.config import Config
 from uruk._internal.store import SessionStore, TaskInfo
-
-from uruk._internal import debug
 
 
 class _DebugInfo(argparse.Action):
@@ -52,6 +50,7 @@ class _DebugInfo(argparse.Action):
     def __call__(self, *args: Any, **kwargs: Any) -> None:  # noqa: ARG002
         debug._print_debug_info()
         sys.exit(0)
+
 
 def _control_socket_path(data_dir: Path) -> Path:
     return data_dir / "control.sock"
@@ -97,9 +96,7 @@ def resume_main() -> None:
     data_dir = Config.data_dir_from_env()
     store = SessionStore(data_dir / "sessions.json")
     sessions = [
-        info
-        for info in store.all()
-        if info.origin == "telegram" and info.session_id and info.owner == "telegram"
+        info for info in store.all() if info.origin == "telegram" and info.session_id and info.owner == "telegram"
     ]
     if not sessions:
         raise SystemExit("uruk resume: no Telegram-owned sessions are ready to resume")
@@ -117,11 +114,10 @@ def resume_main() -> None:
 
     os.chdir(info.repo)
     if info.provider == "claude":
-        os.execvp("claude", ["claude", "--resume", info.session_id])
+        os.execvp("claude", ["claude", "--resume", info.session_id])  # noqa: S606,S607
     if info.provider == "openai":
-        os.execvp("codex", ["codex", "resume", info.session_id])
+        os.execvp("codex", ["codex", "resume", info.session_id])  # noqa: S606,S607
     raise SystemExit(f"uruk resume: unsupported provider {info.provider!r}")
-
 
 
 def get_parser() -> argparse.ArgumentParser:

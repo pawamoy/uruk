@@ -20,6 +20,12 @@ class TaskInfo:
     effort: str | None = None
     status_message_id: int | None = None
     resolved_model: str | None = None  # Actual model reported by the session's init message.
+    # ``origin`` says where the session was first created.  ``owner`` says which
+    # UI is currently allowed to drive it.  Keeping these separate means a
+    # Telegram-created session remains available to ``uruk resume`` after it has
+    # been handed to a terminal and back again.
+    origin: str = "telegram"  # "telegram" or "terminal"
+    owner: str = "telegram"  # "telegram", "terminal", or "transferring"
 
 
 class SessionStore:

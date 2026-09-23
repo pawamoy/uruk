@@ -1,5 +1,5 @@
-"""Uruk: control Claude Code agent sessions from your phone through Telegram."""
+"""Uruk: control Claude Code and Codex sessions through Telegram or a terminal."""
 
-from uruk._internal.bot import main
+from uruk._internal.cli import main
 
 __all__: list[str] = ["main"]

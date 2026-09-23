@@ -22,6 +22,11 @@ class Config:
     data_dir: Path
     repo_prefixes: dict[str, str]
 
+    @staticmethod
+    def data_dir_from_env() -> Path:
+        """Return Uruk's state directory without requiring Telegram settings."""
+        return Path(os.environ.get("URUK_DATA_DIR", "~/.local/share/uruk")).expanduser()
+
     @property
     def configured(self) -> bool:
         """Whether the bot is fully configured (vs. setup mode where only /id works)."""
@@ -47,7 +52,7 @@ class Config:
         if repos_root is not None and not repos_root.is_dir():
             raise ConfigError(f"URUK_REPOS_ROOT is not a directory: {repos_root}")
 
-        data_dir = Path(os.environ.get("URUK_DATA_DIR", "~/.local/share/uruk")).expanduser()
+        data_dir = cls.data_dir_from_env()
         data_dir.mkdir(parents=True, exist_ok=True)
 
         repo_prefixes = {}

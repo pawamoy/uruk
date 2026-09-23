@@ -73,6 +73,8 @@ runtime. Authenticate the GitHub CLI on the machine running Uruk first.
 | `/<model> [--<effort>] <repo> [task…]` | General | Start a Claude session with `fable`, `opus`, `sonnet`, or `haiku`, or a Codex session with `sol`, `terra`, or `luna`, in `<repo>` (absolute path, or relative to `URUK_REPOS_ROOT`). Effort is optionally `--low`, `--medium`, `--high`, `--xhigh`, or `--max`; the rest of the line is the first prompt. Examples: `/fable --max myrepo Fix the tests`, `/terra --high myrepo Review this diff`. |
 | `/repos` | General | List directories under `URUK_REPOS_ROOT`. |
 | `/list` | General | List active and resumable sessions. |
+| `/attach` | General | List recent local Claude and Codex sessions and attach an idle one to a new task topic. |
+| `/release` | a task topic | Wait for the current turn, release the session to a terminal, and show its native resume command. |
 | `/auto [N]` | General | Fetch the first `N` configured Insiders backlog items (default 5), then offer each as a new task with a model-selection button. It uses the active `gh` login and matches GitHub repositories to same-named local directories. |
 | `/interrupt` | a task topic | Interrupt the current agent turn. |
 | `/close` | a task topic | End the session and close the topic. |
@@ -88,6 +90,30 @@ topic is taken as the answer).
 
 Sessions survive bot restarts: session IDs are persisted, and the first message you send in an old
 topic resumes the conversation with full context.
+
+## Moving a session between terminal and Telegram
+
+Only one client should drive a session at a time.  Uruk keeps the provider session ID, so moving
+does not fork the conversation or lose its context.
+
+To take an existing terminal session to your phone, let its current turn finish, leave the terminal
+client, then send `/attach` in General and choose the session. Uruk creates a topic for it. The old
+terminal view is stale after Telegram continues the conversation, so do not use that terminal client
+again.
+
+To return a session that was originally started in Telegram to a terminal, run this locally:
+
+```bash
+uruk resume
+```
+
+Choose a session from the interactive list. If the bot is currently using it, Uruk waits for the
+current turn to finish, closes its SDK client between turns, and then `exec`s either `claude --resume`
+or `codex resume` with the saved session ID. Terminal-origin sessions remain available through each
+provider's own resume UI and are intentionally not listed by `uruk resume`.
+
+For an attached terminal-origin session, use `/release` in its Telegram topic before returning to
+the terminal. It waits for the last turn and prints the exact provider resume command.
 
 ## Security notes
 

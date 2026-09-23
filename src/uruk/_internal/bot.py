@@ -7,6 +7,7 @@ import contextlib
 import html
 import inspect
 import itertools
+import json
 import logging
 import subprocess
 import sys
@@ -16,7 +17,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+from claude_agent_sdk import list_sessions
 from loguru import logger
+from openai_codex import AsyncCodex, CodexConfig
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import TelegramError
@@ -109,6 +112,18 @@ class Pending:
     options: list[str] = field(default_factory=list)
     multi: bool = False
     selected: set[int] = field(default_factory=set)
+    payloads: list[object] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AttachCandidate:
+    """A provider session that is not yet tracked by Uruk."""
+
+    provider: str
+    session_id: str
+    repo: str
+    title: str
+    status: str = "idle"
 
 
 class UrukBot:
@@ -122,6 +137,7 @@ class UrukBot:
         self.awaiting_text: dict[int | None, asyncio.Future] = {}
         self.prompt_dialogues: dict[int | None, asyncio.Task] = {}
         self.auto_runs: dict[int | None, asyncio.Task] = {}
+        self.control_server: asyncio.AbstractServer | None = None
         self.backlog: list[Issue] = []  # Fetched once, in memory, until a full review cycle ends.
         self.backlog_started: set[str] = set()
         self.backlog_skipped: set[str] = set()
@@ -137,6 +153,8 @@ class UrukBot:
         app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CommandHandler("repos", self.cmd_repos))
         app.add_handler(CommandHandler("list", self.cmd_list))
+        app.add_handler(CommandHandler("attach", self.cmd_attach))
+        app.add_handler(CommandHandler("release", self.cmd_release))
         app.add_handler(CommandHandler("interrupt", self.cmd_interrupt))
         app.add_handler(CommandHandler("close", self.cmd_close))
         app.add_handler(CommandHandler("purge", self.cmd_purge))
@@ -159,6 +177,81 @@ class UrukBot:
         self.auto_runs.clear()
         for task in list(self.tasks.values()):
             await task.close()
+        if self.control_server is not None:
+            self.control_server.close()
+            await self.control_server.wait_closed()
+            self.control_server = None
+        with contextlib.suppress(OSError):
+            self._control_socket_path().unlink()
+
+    def _control_socket_path(self) -> Path:
+        """The local-only control socket used by ``uruk resume``."""
+        return self.config.data_dir / "control.sock"
+
+    async def start_control_server(self, app: Application) -> None:
+        """Accept local requests to hand a Telegram session to a terminal.
+
+        This keeps the ownership change in the bot process: it can wait for the
+        current turn to finish before its SDK client is closed.  The Unix socket
+        is deliberately local-only and lives beside the session state.
+        """
+        path = self._control_socket_path()
+        with contextlib.suppress(OSError):
+            path.unlink()
+        self.control_server = await asyncio.start_unix_server(self._on_control_connection, path)
+
+    async def _on_control_connection(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        response: dict[str, object]
+        try:
+            raw = await reader.readline()
+            request = json.loads(raw)
+            if request.get("action") != "resume" or not isinstance(request.get("topic_id"), int):
+                raise ValueError("unknown request")
+            await self._release_to_terminal(request["topic_id"], telegram_origin_only=True)
+            response = {"ok": True}
+        except Exception as error:
+            logger.warning("local control request failed: {}", error)
+            response = {"ok": False, "error": str(error)}
+        writer.write((json.dumps(response) + "\n").encode())
+        with contextlib.suppress(Exception):
+            await writer.drain()
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+
+    async def _release_to_terminal(self, topic_id: int, *, telegram_origin_only: bool = False) -> None:
+        """Wait for a Telegram turn, then stop its client and release the session."""
+        info = self.store.get(topic_id)
+        if info is None:
+            raise RuntimeError("session is no longer tracked by Uruk")
+        if telegram_origin_only and info.origin != "telegram":
+            raise RuntimeError("only Telegram-created sessions are available through uruk resume")
+        if info.owner == "terminal":
+            return
+        if info.owner == "transferring":
+            raise RuntimeError("a handoff is already in progress")
+        if any(pending.topic_id == topic_id for pending in self.pending.values()):
+            raise RuntimeError("answer the pending Telegram question or approval before handing off")
+
+        info.owner = "transferring"
+        self.store.save()
+        task = self._get_task(topic_id)
+        if task is not None:
+            if task.turn_running:
+                await self._send(topic_id, "⏳ Finishing this turn before releasing it to your terminal…")
+            while task.turn_running:
+                await asyncio.sleep(0.25)
+            # ``close`` is called only between turns, so it cancels a worker
+            # waiting for its next prompt rather than interrupting the last one.
+            await task.close()
+            self.tasks.pop(topic_id, None)
+        info.owner = "terminal"
+        self.store.save()
+        await self._send(topic_id, "💻 Released to your terminal. This topic is now read-only until you attach it again.")
 
     def _authorized(self, user_id: int | None, chat_id: int | None) -> bool:
         if not self.config.configured:
@@ -388,6 +481,18 @@ class UrukBot:
                     await query.answer()
                     await self._finalize(query, f"→ {answer}")
 
+        if kind == "x":
+            try:
+                candidate = pending.payloads[int(arg)]
+            except (IndexError, ValueError):
+                await query.answer("Unknown session.")
+                return
+            del self.pending[pid]
+            pending.future.set_result(candidate)
+            await query.answer()
+            await self._finalize(query, "→ Selected")
+            return
+
         if kind == "a":
             if arg != "skip" and arg not in MODEL_COMMANDS:
                 await query.answer("Unknown model.")
@@ -408,6 +513,7 @@ class UrukBot:
         command = query.data.removeprefix("c:")
         handlers = {
             "auto": self.cmd_auto,
+            "attach": self.cmd_attach,
             "purge": self.cmd_purge,
             "repos": self.cmd_repos,
             "list": self.cmd_list,
@@ -584,6 +690,11 @@ class UrukBot:
                 "No session is attached to this topic. Start one with a model command in the General topic."
             )
             return
+        if task.info.owner != "telegram":
+            await message.reply_text(
+                "This session is checked out to a terminal. Attach it again from General before sending it Telegram messages."
+            )
+            return
         await task.submit(message.text)
         with contextlib.suppress(TelegramError):
             await message.set_reaction("👍")
@@ -614,6 +725,7 @@ class UrukBot:
                 InlineKeyboardButton("⚡ Auto", callback_data="c:auto"),
             ],
             [
+                InlineKeyboardButton("📲 Attach", callback_data="c:attach"),
                 InlineKeyboardButton("🗑 Purge", callback_data="c:purge"),
                 InlineKeyboardButton("📁 Repos", callback_data="c:repos"),
             ],
@@ -645,6 +757,8 @@ class UrukBot:
             "/<fable|opus|sonnet|haiku|sol|terra|luna> [--<effort>] <repo> [task…] — start a session\n"
             "/repos — list repositories\n"
             "/list — list sessions\n"
+            "/attach — attach an idle local Claude or Codex session (in General)\n"
+            "/release — wait for this turn, then release it to a terminal (in a task topic)\n"
             "/auto [N] — offer the next N unreviewed backlog items as new tasks (in General); "
             "the backlog is fetched once and cycles when fully reviewed\n"
             "/interrupt — interrupt the current turn (in a task topic)\n"
@@ -652,7 +766,7 @@ class UrukBot:
             "/purge — delete topics closed with /close, and forget sessions whose topics were deleted by hand\n"
             "/model [name|default] — show or change this task's model (in a task topic)\n"
             "/effort [low|medium|high|xhigh|max|default] — show or change this task's effort (in a task topic)\n"
-            "Any text inside a task topic goes to that session."
+            "Any text inside a Telegram-owned task topic goes to that session."
         )
 
     async def cmd_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -967,7 +1081,11 @@ class UrukBot:
         lines = []
         for info in self.store.all():
             task = self.tasks.get(info.topic_id)
-            if task is not None and task.turn_running:
+            if info.owner == "terminal":
+                status = "💻 terminal"
+            elif info.owner == "transferring":
+                status = "🔄 transferring"
+            elif task is not None and task.turn_running:
                 status = "🟢 running"
             elif task is not None and task.active:
                 status = "🔵 idle"
@@ -975,6 +1093,206 @@ class UrukBot:
                 status = "💤 resumable"
             lines.append(f"{status} — {Path(info.repo).name} — {info.title}")
         await update.effective_message.reply_text("\n".join(lines) or "No sessions.")
+
+    async def cmd_attach(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Offer local Claude and Codex sessions to take over in Telegram."""
+        if not self._auth(update):
+            return
+        message = update.effective_message
+        if not self._is_main_thread(message):
+            await message.reply_text("Use /attach in the General topic.")
+            return
+        await message.reply_text("🔎 Looking for local Claude and Codex sessions…")
+        try:
+            candidates = await self._discover_attach_candidates()
+        except Exception:
+            logger.exception("discovering local sessions failed")
+            await message.reply_text("Could not list local sessions; see the Uruk log for details.")
+            return
+        if not candidates:
+            await message.reply_text("No untracked local sessions were found.")
+            return
+        candidate = await self._choose_attach_candidate(message.message_thread_id, candidates)
+        if not isinstance(candidate, AttachCandidate):
+            return
+        if candidate.status == "active":
+            await message.reply_text(
+                "That session still has an active turn. Let it finish and close the terminal client, "
+                "then run /attach again. Uruk will not take over a live terminal client."
+            )
+            return
+        await self._attach_candidate(message, candidate)
+
+    async def _discover_attach_candidates(self) -> list[AttachCandidate]:
+        """List recent provider sessions which are not already owned by Uruk."""
+        tracked = {
+            info.session_id
+            for info in self.store.all()
+            if info.session_id and not (info.origin == "terminal" and info.owner == "terminal")
+        }
+        claude, active_claude = await asyncio.gather(
+            asyncio.to_thread(list_sessions, limit=12),
+            asyncio.to_thread(self._active_claude_session_ids),
+        )
+        candidates = [
+            AttachCandidate(
+                provider="claude",
+                session_id=session.session_id,
+                repo=session.cwd or "",
+                title=session.summary or session.first_prompt or "Claude session",
+                status="active" if session.session_id in active_claude else "idle",
+            )
+            for session in claude
+            if session.session_id not in tracked and session.cwd and Path(session.cwd).is_dir()
+        ]
+        async with AsyncCodex(CodexConfig()) as codex:
+            threads = await codex.thread_list(limit=12)
+        for thread in threads.data:
+            if thread.id in tracked or not Path(str(thread.cwd)).is_dir():
+                continue
+            status = getattr(thread.status.root, "type", "idle")
+            candidates.append(
+                AttachCandidate(
+                    provider="openai",
+                    session_id=thread.id,
+                    repo=str(thread.cwd),
+                    title=thread.name or thread.preview or "Codex session",
+                    status=str(getattr(status, "value", status)),
+                )
+            )
+        # Both providers return most-recent-first lists.  A single compact
+        # picker is more usable on a phone than exhaustive pagination.
+        return candidates[:20]
+
+    @staticmethod
+    def _active_claude_session_ids() -> set[str]:
+        """Read the CLI's machine-readable list of live Claude sessions.
+
+        The SDK's transcript listing deliberately has no liveness field.  The
+        Claude CLI does, and this parser is tolerant of either snake_case or
+        camelCase names while the CLI format evolves.
+        """
+        try:
+            result = subprocess.run(
+                ["claude", "agents", "--json"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            sessions = json.loads(result.stdout)
+        except (FileNotFoundError, subprocess.SubprocessError, json.JSONDecodeError):
+            return set()
+        if not isinstance(sessions, list):
+            return set()
+        return {
+            session_id
+            for session in sessions
+            if isinstance(session, dict)
+            and isinstance((session_id := session.get("session_id") or session.get("sessionId")), str)
+        }
+
+    async def _choose_attach_candidate(
+        self,
+        topic_id: int | None,
+        candidates: list[AttachCandidate],
+    ) -> AttachCandidate | None:
+        pid = next(self._pid)
+        pending = Pending(
+            kind="attach",
+            future=asyncio.get_running_loop().create_future(),
+            topic_id=topic_id,
+            payloads=list(candidates),
+        )
+        self.pending[pid] = pending
+        rows = []
+        for index, candidate in enumerate(candidates):
+            provider = "Claude" if candidate.provider == "claude" else "Codex"
+            status = " · busy" if candidate.status == "active" else ""
+            label = f"{provider} · {Path(candidate.repo).name} · {candidate.title}".replace("\n", " ")
+            rows.append([InlineKeyboardButton((label[:56] + status)[:64], callback_data=f"x:{pid}:{index}")])
+        await self._send(
+            topic_id,
+            "Choose a local session to attach. Busy sessions stay in their terminal until the current turn ends.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        result = await pending.future
+        return result if isinstance(result, AttachCandidate) else None
+
+    async def _attach_candidate(self, message, candidate: AttachCandidate) -> None:
+        """Create the topic and defer the provider resume until its first message."""
+        existing = next(
+            (
+                info
+                for info in self.store.all()
+                if info.session_id == candidate.session_id
+                and info.origin == "terminal"
+                and info.owner == "terminal"
+            ),
+            None,
+        )
+        if existing is not None:
+            existing.owner = "telegram"
+            self.store.save()
+            self.tasks[existing.topic_id] = self._make_task(existing)
+            await self._send(
+                existing.topic_id,
+                "📲 Attached again. The terminal client is now stale; do not use it. "
+                "Send a message here to continue.",
+            )
+            await message.reply_text(f"Attached again: {Path(existing.repo).name} · {existing.title}")
+            return
+        info = TaskInfo(
+            topic_id=0,
+            repo=candidate.repo,
+            title=candidate.title[:60],
+            provider=candidate.provider,
+            session_id=candidate.session_id,
+            origin="terminal",
+            owner="telegram",
+        )
+        try:
+            topic = await self.app.bot.create_forum_topic(
+                chat_id=self.config.chat_id,
+                name=self._topic_name(info),
+            )
+        except TelegramError as error:
+            await message.reply_text(f"Could not create an attachment topic: {error}")
+            return
+        info.topic_id = topic.message_thread_id
+        self.store.set(info)
+        self.tasks[info.topic_id] = self._make_task(info)
+        await self._pin_status(info)
+        await self._send(
+            info.topic_id,
+            "📲 Attached from a terminal session. The terminal client is now stale; do not use it. "
+            "Send a message here to continue.",
+        )
+        await message.reply_text(f"Attached: {Path(info.repo).name} · {info.title}")
+
+    async def cmd_release(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Release a topic so its provider session can be resumed in a terminal."""
+        if not self._auth(update):
+            return
+        message = update.effective_message
+        topic_id = message.message_thread_id
+        if topic_id is None or self.store.get(topic_id) is None:
+            await message.reply_text("Use /release inside a task topic.")
+            return
+        try:
+            await self._release_to_terminal(topic_id)
+        except RuntimeError as error:
+            await message.reply_text(f"Cannot release this session: {error}")
+            return
+        info = self.store.get(topic_id)
+        if info is None or not info.session_id:
+            return
+        command = (
+            f"claude --resume {info.session_id}"
+            if info.provider == "claude"
+            else f"codex resume {info.session_id}"
+        )
+        await message.reply_text(f"Resume it from {info.repo}:\n<code>{html.escape(command)}</code>", parse_mode=ParseMode.HTML)
 
     async def cmd_interrupt(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update):
@@ -1076,6 +1394,9 @@ class UrukBot:
         if task is None:
             await message.reply_text("Use /model inside a task topic.")
             return
+        if task.info.owner != "telegram":
+            await message.reply_text("This session is checked out to a terminal; change its model there.")
+            return
         if not context.args:
             current = task.info.resolved_model or task.info.model
             if current is None and task.info.provider == "claude":
@@ -1109,6 +1430,9 @@ class UrukBot:
         task = self._topic_task(update)
         if task is None:
             await message.reply_text("Use /effort inside a task topic.")
+            return
+        if task.info.owner != "telegram":
+            await message.reply_text("This session is checked out to a terminal; change its effort there.")
             return
         if not context.args:
             default_effort = "default" if task.info.provider == "openai" else "high (default)"
@@ -1235,7 +1559,13 @@ def main() -> None:
     except ConfigError as error:
         sys.exit(f"uruk: {error}")
     bot = UrukBot(config)
-    app = Application.builder().token(config.token).post_shutdown(bot.shutdown).build()
+    app = (
+        Application.builder()
+        .token(config.token)
+        .post_init(bot.start_control_server)
+        .post_shutdown(bot.shutdown)
+        .build()
+    )
     bot.attach(app)
     if config.configured:
         logger.info(

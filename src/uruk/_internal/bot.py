@@ -1531,7 +1531,10 @@ class UrukBot:
         deleted, failed = 0, 0
         for topic_id in self.store.closed():
             try:
-                await self._application().bot.delete_forum_topic(chat_id=self.config.chat_id, message_thread_id=topic_id)
+                await self._application().bot.delete_forum_topic(
+                    chat_id=self.config.chat_id,
+                    message_thread_id=topic_id,
+                )
             except TelegramError as error:  # noqa: PERF203
                 if "not found" in str(error).lower():  # Already deleted by hand: stop tracking it.
                     self.store.remove_closed(topic_id)

@@ -28,7 +28,14 @@ classifiers = [
     "Topic :: Utilities",
     "Typing :: Typed",
 ]
-dependencies = []
+dependencies = [
+    "claude-agent-sdk>=0.1",
+    "insiders",
+    "loguru>=0.7",
+    "openai-codex>=0.144.4",
+    "python-telegram-bot>=21.0",
+    "telegramify-markdown>=1.2.0",
+]
 
 [project.urls]
 Homepage = "https://pawamoy.github.io/uruk"

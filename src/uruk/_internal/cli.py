@@ -132,6 +132,8 @@ def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="uruk")
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {debug._get_version()}")
     parser.add_argument("--debug-info", action=_DebugInfo, help="Print debug information.")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("resume", help="Resume a Telegram-created session in its native CLI.")
     return parser
 
 

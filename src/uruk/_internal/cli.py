@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from uruk._internal import debug
-from uruk._internal.bot import main as run_bot
+from uruk._internal.bot import _run_bot as run_bot
 from uruk._internal.config import Config
 from uruk._internal.store import SessionStore, TaskInfo
 

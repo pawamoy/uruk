@@ -31,14 +31,24 @@ class ConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class Config:
+    """Telegram settings, agent defaults, and paths used by the bot."""
+
     token: str
+    """Telegram bot token."""
     chat_id: int | None
+    """Authorized Telegram chat, or `None` during setup."""
     owner_id: int | None
+    """Authorized Telegram user, or `None` during setup."""
     repos_root: Path | None
+    """Directory containing repositories available to the bot."""
     permission_mode: str
+    """Default permission mode for Claude sessions."""
     model: str | None
+    """Default Claude model, or `None` to use the provider default."""
     data_dir: Path
+    """Directory containing session state and the local control socket."""
     repo_prefixes: dict[str, str]
+    """Repository owner names mapped to local directory prefixes."""
 
     @staticmethod
     def data_dir_from_env() -> Path:
@@ -52,6 +62,11 @@ class Config:
 
     @classmethod
     def from_env(cls) -> Config:
+        """Read settings from environment variables and create the state directory.
+
+        Raises:
+            ConfigError: The bot token is missing or a setting is invalid.
+        """
         token = os.environ.get("TELEGRAM_BOT_TOKEN")
         if not token:
             raise ConfigError("TELEGRAM_BOT_TOKEN is not set (get one from @BotFather)")

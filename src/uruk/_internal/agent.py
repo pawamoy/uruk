@@ -49,37 +49,72 @@ if TYPE_CHECKING:
 
 # Tools whose (auto-approved) use is worth a one-line notice in the topic.
 # Reads and searches stay silent; anything that needs approval shows up as a prompt anyway.
-SHOWN_TOOLS = {"Bash", "Edit", "Write", "NotebookEdit"}
+_SHOWN_TOOLS = {"Bash", "Edit", "Write", "NotebookEdit"}
 
 
 class UI(Protocol):
     """What the agent side needs from the Telegram side."""
 
-    async def send_text(self, topic_id: int, text: str) -> None: ...
-    async def send_activity(self, topic_id: int, text: str) -> None: ...
-    async def send_typing(self, topic_id: int) -> None: ...
-    async def ask_permission(self, topic_id: int, tool_name: str, input_data: dict) -> bool: ...
-    async def ask_question(self, topic_id: int, question: dict) -> str: ...
-    async def refresh_status(self, topic_id: int) -> None: ...
+    async def send_text(self, topic_id: int, text: str) -> None:
+        """Send an agent response to a topic."""
+        ...
+
+    async def send_activity(self, topic_id: int, text: str) -> None:
+        """Send a short activity notice to a topic."""
+        ...
+
+    async def send_typing(self, topic_id: int) -> None:
+        """Show a typing indicator in a topic."""
+        ...
+
+    async def ask_permission(self, topic_id: int, tool_name: str, input_data: dict) -> bool:
+        """Ask whether a tool call is allowed and return the decision."""
+        ...
+
+    async def ask_question(self, topic_id: int, question: dict) -> str:
+        """Present a question and return the selected or typed answer."""
+        ...
+
+    async def refresh_status(self, topic_id: int) -> None:
+        """Refresh the pinned status message for a topic."""
+        ...
 
 
 class AgentTask(Protocol):
     """Provider-neutral task interface used by the Telegram bot."""
 
     info: TaskInfo
+    """Persistent session metadata."""
     turn_running: bool
+    """Whether the agent is currently processing a prompt."""
 
     @property
-    def active(self) -> bool: ...
+    def active(self) -> bool:
+        """Whether the session worker is running."""
+        ...
 
-    async def submit(self, text: str) -> None: ...
-    async def interrupt(self) -> bool: ...
-    async def close(self) -> None: ...
-    async def set_model(self, model: str | None) -> bool: ...
-    async def set_effort(self, effort: str | None) -> None: ...
+    async def submit(self, text: str) -> None:
+        """Queue a prompt, starting or resuming the session as needed."""
+        ...
+
+    async def interrupt(self) -> bool:
+        """Interrupt the current turn and return whether a turn was interrupted."""
+        ...
+
+    async def close(self) -> None:
+        """Stop the session worker while preserving the resumable conversation."""
+        ...
+
+    async def set_model(self, model: str | None) -> bool:
+        """Set the model and return whether the session is already open."""
+        ...
+
+    async def set_effort(self, effort: str | None) -> None:
+        """Set the reasoning effort for subsequent turns."""
+        ...
 
 
-def summarize_tool_input(tool_name: str, input_data: dict[str, Any]) -> str:
+def _summarize_tool_input(tool_name: str, input_data: dict[str, Any]) -> str:
     """A short human-readable rendering of a tool call's input."""
     input_data = input_data or {}
     if tool_name == "Bash":
@@ -103,18 +138,27 @@ class ClaudeAgentTask:
         default_model: str | None,
         on_state_change: Callable[[], None],
     ) -> None:
+        """Prepare a Claude task that saves state changes through `on_state_change`."""
         self.ui = ui
+        """Interface used to send responses and request user input."""
         self.info = info
+        """Persistent session metadata."""
         self.permission_mode = permission_mode
+        """Claude permission mode used when the session starts."""
         self.default_model = default_model
+        """Model used when the task has no explicit model setting."""
         self.on_state_change = on_state_change
+        """Callback used to persist changes to session metadata."""
         self.inbox: asyncio.Queue[str] = asyncio.Queue()
+        """Queue of prompts waiting to be processed."""
         self.turn_running = False
+        """Whether the agent is currently processing a prompt."""
         self._client: ClaudeSDKClient | None = None
         self._worker: asyncio.Task | None = None
 
     @property
     def active(self) -> bool:
+        """Whether the session worker is running."""
         return self._worker is not None and not self._worker.done()
 
     async def submit(self, text: str) -> None:
@@ -131,6 +175,7 @@ class ClaudeAgentTask:
         return False
 
     async def close(self) -> None:
+        """Stop the session worker while preserving the resumable conversation."""
         if self._worker is not None:
             self._worker.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -221,8 +266,8 @@ class ClaudeAgentTask:
             for block in message.content:
                 if isinstance(block, TextBlock) and block.text.strip():
                     await self.ui.send_text(self.info.topic_id, block.text)
-                elif isinstance(block, ToolUseBlock) and block.name in SHOWN_TOOLS:
-                    summary = summarize_tool_input(block.name, block.input)
+                elif isinstance(block, ToolUseBlock) and block.name in _SHOWN_TOOLS:
+                    summary = _summarize_tool_input(block.name, block.input)
                     first_line = summary.splitlines()[0][:180] if summary else ""
                     await self.ui.send_activity(self.info.topic_id, f"⚙️ {block.name}: {first_line}")
         elif isinstance(message, ResultMessage):

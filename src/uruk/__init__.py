@@ -23,6 +23,24 @@ Telegram bot to drive Claude Code and OpenAI Codex sessions from your phone.
 
 from __future__ import annotations
 
-from uruk._internal.cli import get_parser, main
+from uruk._internal.agent import UI, AgentTask, ClaudeAgentTask
+from uruk._internal.bot import UrukBot
+from uruk._internal.cli import get_parser, main, resume_main
+from uruk._internal.codex_agent import CodexAgentTask
+from uruk._internal.config import Config, ConfigError
+from uruk._internal.store import SessionStore, TaskInfo
 
-__all__: list[str] = ["get_parser", "main"]
+__all__: list[str] = [
+    "UI",
+    "AgentTask",
+    "ClaudeAgentTask",
+    "CodexAgentTask",
+    "Config",
+    "ConfigError",
+    "SessionStore",
+    "TaskInfo",
+    "UrukBot",
+    "get_parser",
+    "main",
+    "resume_main",
+]

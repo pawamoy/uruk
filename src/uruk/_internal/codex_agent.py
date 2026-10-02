@@ -52,11 +52,17 @@ class CodexAgentTask:
         *,
         on_state_change: Callable[[], None],
     ) -> None:
+        """Prepare a Codex task that saves state changes through `on_state_change`."""
         self.ui = ui
+        """Interface used to send responses and activity notices."""
         self.info = info
+        """Persistent session metadata."""
         self.on_state_change = on_state_change
+        """Callback used to persist changes to session metadata."""
         self.inbox: asyncio.Queue[str] = asyncio.Queue()
+        """Queue of prompts waiting to be processed."""
         self.turn_running = False
+        """Whether the agent is currently processing a prompt."""
         self._codex: AsyncCodex | None = None
         self._thread: AsyncThread | None = None
         self._turn: AsyncTurnHandle | None = None
@@ -64,6 +70,7 @@ class CodexAgentTask:
 
     @property
     def active(self) -> bool:
+        """Whether the session worker is running."""
         return self._worker is not None and not self._worker.done()
 
     async def submit(self, text: str) -> None:
@@ -76,12 +83,14 @@ class CodexAgentTask:
         await self.inbox.put(text)
 
     async def interrupt(self) -> bool:
+        """Interrupt the current turn and return whether a turn was interrupted."""
         if self._turn is not None and self.turn_running:
             await self._turn.interrupt()
             return True
         return False
 
     async def close(self) -> None:
+        """Stop the session worker while preserving the resumable conversation."""
         if self._worker is not None:
             self._worker.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):

@@ -27,6 +27,7 @@ import inspect
 import itertools
 import json
 import logging
+import secrets
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -55,13 +56,13 @@ from telegram.ext import (
 from telegramify_markdown import telegramify
 from telegramify_markdown.content import File, Photo, Text
 
-from uruk._internal.agent import AgentTask, ClaudeAgentTask, _summarize_tool_input
+from uruk._internal.agent import AgentTask, ClaudeAgentTask, _InteractionCancelledError, _summarize_tool_input
 from uruk._internal.codex_agent import CodexAgentTask
 from uruk._internal.config import Config, ConfigError
 from uruk._internal.store import SessionStore, TaskInfo
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Awaitable, Callable, Coroutine, Iterator
 
 _MESSAGE_LIMIT = 4000  # Telegram caps messages at 4096 chars; keep headroom.
 _MIN_FILE_LINES = 30  # Code blocks longer than this become file attachments.
@@ -79,6 +80,8 @@ _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 _EFFORT_PREFIXES = ("--", "–", "—")  # noqa: RUF001  # Telegram can replace hyphens with these dashes.
 _AUTO_DEFAULT_LIMIT = 5
 _AUTO_MAX_LIMIT = 20
+_DISCOVERY_TIMEOUT = 120
+_UPDATE_TIMEOUT = 30
 
 
 def _parse_effort_flag(argument: str) -> str | None:
@@ -155,6 +158,11 @@ class UrukBot:
         """Telegram settings, agent defaults, and state paths."""
         self.store = SessionStore(config.data_dir / "sessions.json")
         """Persistent session state."""
+        interrupted_handoffs = [info for info in self.store.all() if info.owner == "transferring"]
+        for info in interrupted_handoffs:
+            info.owner = "telegram"
+        if interrupted_handoffs:
+            self.store.save()
         self.tasks: dict[int, AgentTask] = {}
         """Live agent tasks indexed by Telegram topic ID."""
         self.pending: dict[int, _Pending] = {}
@@ -165,6 +173,9 @@ class UrukBot:
         """Background dialogues used to collect prompts for new sessions."""
         self.auto_runs: dict[int | None, asyncio.Task] = {}
         """Background tasks working through backlog issues."""
+        self._attach_runs: dict[int | None, asyncio.Task] = {}
+        self._release_runs: dict[int | None, asyncio.Task] = {}
+        self._shutting_down = False
         self.control_server: asyncio.AbstractServer | None = None
         """Local server used to hand sessions to terminal clients."""
         self.backlog: list[Issue] = []  # Fetched once, in memory, until a full review cycle ends.
@@ -173,7 +184,8 @@ class UrukBot:
         """Issue keys started during the current review cycle."""
         self.backlog_skipped: set[str] = set()
         """Issue keys skipped during the current review cycle."""
-        self._pid = itertools.count(1)
+        # Buttons from a previous process must not answer a new interaction.
+        self._pid = itertools.count(secrets.randbits(48))
         self.app: Application | None = None
         """Attached Telegram application, or `None` before attachment."""
 
@@ -182,25 +194,48 @@ class UrukBot:
     def attach(self, app: Application) -> None:
         """Attach the Telegram application and register its command and message handlers."""
         self.app = app
-        app.add_handler(CommandHandler("id", self._cmd_id))
-        app.add_handler(CommandHandler("start", self._cmd_help))
-        app.add_handler(CommandHandler("help", self._cmd_help))
-        app.add_handler(CommandHandler("repos", self._cmd_repos))
-        app.add_handler(CommandHandler("list", self._cmd_list))
-        app.add_handler(CommandHandler("attach", self._cmd_attach))
-        app.add_handler(CommandHandler("release", self._cmd_release))
-        app.add_handler(CommandHandler("interrupt", self._cmd_interrupt))
-        app.add_handler(CommandHandler("close", self._cmd_close))
-        app.add_handler(CommandHandler("purge", self._cmd_purge))
-        app.add_handler(CommandHandler("auto", self._cmd_auto))
-        app.add_handler(CommandHandler("model", self._cmd_model))
-        app.add_handler(CommandHandler("effort", self._cmd_effort))
-        app.add_handler(CommandHandler(tuple(_MODEL_COMMANDS), self._cmd_new_model))
-        app.add_handler(CallbackQueryHandler(self._on_button))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
+        for commands, callback in (
+            ("id", self._cmd_id),
+            ("start", self._cmd_help),
+            ("help", self._cmd_help),
+            ("repos", self._cmd_repos),
+            ("list", self._cmd_list),
+            ("attach", self._cmd_attach),
+            ("release", self._cmd_release),
+            ("interrupt", self._cmd_interrupt),
+            ("cancel", self._cmd_cancel),
+            ("close", self._cmd_close),
+            ("purge", self._cmd_purge),
+            ("auto", self._cmd_auto),
+            ("model", self._cmd_model),
+            ("effort", self._cmd_effort),
+            (tuple(_MODEL_COMMANDS), self._cmd_new_model),
+        ):
+            app.add_handler(CommandHandler(commands, self._bounded_handler(callback)))
+        app.add_handler(CallbackQueryHandler(self._bounded_handler(self._on_button)))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._bounded_handler(self._on_text)))
+        app.add_handler(MessageHandler(filters.COMMAND, self._bounded_handler(self._on_unknown_command)))
+        app.add_handler(MessageHandler(filters.ALL & ~filters.TEXT & ~filters.StatusUpdate.ALL, self._bounded_handler(self._on_non_text)))
         # Handler groups are processed in order. This deliberately comes after the
         # command handlers so the panel follows each command's response.
-        app.add_handler(MessageHandler(filters.COMMAND, self._show_command_panel), group=1)
+        app.add_handler(MessageHandler(filters.COMMAND, self._bounded_handler(self._show_command_panel)), group=1)
+
+    def _bounded_handler(self, callback: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, None]]:
+        """Keep a stalled command or SDK call from holding the update dispatcher."""
+        async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            try:
+                async with asyncio.timeout(_UPDATE_TIMEOUT):
+                    await callback(update, context)
+            except TimeoutError:
+                logger.warning("Telegram handler timed out")
+                if self._auth(update):
+                    await self._send(self._message(update).message_thread_id, "⌛ That action timed out. You can retry it, or use /cancel to stop a waiting flow.")
+            except Exception:  # noqa: BLE001
+                logger.exception("Telegram handler failed")
+                if self._auth(update):
+                    await self._send(self._message(update).message_thread_id, "⚠️ That action failed. You can retry it; see the bot logs for details.")
+
+        return handle
 
     def _application(self) -> Application:
         """Return the Telegram application after it has been attached."""
@@ -210,12 +245,16 @@ class UrukBot:
 
     async def shutdown(self, app: Application) -> None:  # noqa: ARG002
         """Cancel background work, close agent sessions, and remove the control socket."""
-        for dialogue in self.prompt_dialogues.values():
-            dialogue.cancel()
-        self.prompt_dialogues.clear()
-        for run in self.auto_runs.values():
-            run.cancel()
-        self.auto_runs.clear()
+        self._shutting_down = True
+        flows = [task for mapping in self._flow_maps() for task in mapping.values()]
+        for task in flows:
+            task.cancel()
+        if flows:
+            await asyncio.gather(*flows, return_exceptions=True)
+        for mapping in self._flow_maps():
+            mapping.clear()
+        for topic_id in {pending.topic_id for pending in self.pending.values()} | set(self.awaiting_text):
+            self._cancel_interactions(topic_id)
         for task in list(self.tasks.values()):
             await task.close()
         if self.control_server is not None:
@@ -224,6 +263,82 @@ class UrukBot:
             self.control_server = None
         with contextlib.suppress(OSError):
             self._control_socket_path().unlink()
+
+    @staticmethod
+    def _topic_key(topic_id: int | None) -> int | None:
+        """Use one key for both forms of Telegram's General topic."""
+        return None if topic_id == 1 else topic_id
+
+    def _flow_maps(self) -> tuple[dict[int | None, asyncio.Task], ...]:
+        return self.prompt_dialogues, self.auto_runs, self._attach_runs, self._release_runs
+
+    def _flow_running(self, topic_id: int | None) -> bool:
+        topic_id = self._topic_key(topic_id)
+        return any((task := mapping.get(topic_id)) is not None and not task.done() for mapping in self._flow_maps())
+
+    def _start_flow(self, mapping: dict[int | None, asyncio.Task], topic_id: int | None, operation: Callable[[], Awaitable[None]]) -> None:
+        """Run a dialogue without blocking Telegram's update dispatcher."""
+        topic_id = self._topic_key(topic_id)
+
+        async def run() -> None:
+            try:
+                await operation()
+            except TimeoutError:
+                await self._send(topic_id, "⌛ This flow timed out. Start it again when you are ready.")
+            except _InteractionCancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                logger.exception("conversation flow in topic {} failed", topic_id)
+                await self._send(topic_id, "⚠️ This flow failed. Start it again; see the bot logs for details.")
+            finally:
+                if mapping.get(topic_id) is asyncio.current_task():
+                    mapping.pop(topic_id, None)
+                if topic_id is None and not self._shutting_down:
+                    await self._maybe_show_panel(topic_id)
+
+        mapping[topic_id] = asyncio.create_task(run())
+
+    def _cancel_interactions(self, topic_id: int | None) -> bool:
+        """Cancel all button and text waits in one topic."""
+        topic_id = self._topic_key(topic_id)
+        cancelled = False
+        for pid, pending in list(self.pending.items()):
+            if pending.topic_id == topic_id:
+                self.pending.pop(pid, None)
+                if not pending.future.done():
+                    if pending.kind == "perm":
+                        pending.future.set_result(False)
+                    else:
+                        pending.future.set_exception(_InteractionCancelledError("Telegram interaction cancelled"))
+                cancelled = True
+        if (future := self.awaiting_text.pop(topic_id, None)) is not None:
+            if not future.done():
+                future.set_exception(_InteractionCancelledError("Telegram interaction cancelled"))
+            cancelled = True
+        return cancelled
+
+    async def _wait_for_reply(self, pid: int, pending: _Pending, text: str, *, expires_after: float | None, **kwargs: Any) -> Any:
+        """Wait for a reply with the caller's timeout and clean up on every exit."""
+        pending.topic_id = self._topic_key(pending.topic_id)
+        self.pending[pid] = pending
+        message = None
+        try:
+            async with asyncio.timeout(expires_after):
+                message = await self._send(pending.topic_id, text, **kwargs)
+                if message is None:
+                    raise RuntimeError("could not send the interaction to Telegram")
+                return await pending.future
+        finally:
+            self.pending.pop(pid, None)
+            if self.awaiting_text.get(pending.topic_id) is pending.future:
+                self.awaiting_text.pop(pending.topic_id, None)
+            if not pending.future.done():
+                pending.future.cancel()
+            elif not pending.future.cancelled():
+                pending.future.exception()
+            if message is not None:
+                with contextlib.suppress(TelegramError):
+                    await message.edit_reply_markup(None)
 
     def _control_socket_path(self) -> Path:
         """The local-only control socket used by ``uruk resume``."""
@@ -248,7 +363,7 @@ class UrukBot:
     ) -> None:
         response: dict[str, object]
         try:
-            raw = await reader.readline()
+            raw = await asyncio.wait_for(reader.readline(), _DISCOVERY_TIMEOUT)
             request = json.loads(raw)
             if request.get("action") != "resume" or not isinstance(request.get("topic_id"), int):
                 raise ValueError("unknown request")  # noqa: TRY301
@@ -280,18 +395,23 @@ class UrukBot:
 
         info.owner = "transferring"
         self.store.save()
-        task = self._get_task(topic_id)
-        if task is not None:
-            if task.turn_running:
-                await self._send(topic_id, "⏳ Finishing this turn before releasing it to your terminal…")
-            while task.turn_running:  # noqa: ASYNC110
-                await asyncio.sleep(0.25)
-            # ``close`` is called only between turns, so it cancels a worker
-            # waiting for its next prompt rather than interrupting the last one.
-            await task.close()
-            self.tasks.pop(topic_id, None)
-        info.owner = "terminal"
-        self.store.save()
+        try:
+            async with asyncio.timeout(self.config.interaction_timeout):
+                task = self._get_task(topic_id)
+                if task is not None:
+                    if task.turn_running:
+                        await self._send(topic_id, "⏳ Finishing this turn before releasing it to your terminal… Use /cancel to stop the handoff.")
+                    while task.turn_running:  # noqa: ASYNC110
+                        await asyncio.sleep(0.25)
+                    # Close the SDK client between turns, after the last turn finishes.
+                    await task.close()
+                    self.tasks.pop(topic_id, None)
+                info.owner = "terminal"
+                self.store.save()
+        finally:
+            if info.owner == "transferring":
+                info.owner = "telegram"
+                self.store.save()
         await self._send(
             topic_id,
             "💻 Released to your terminal. This topic is now read-only until you attach it again.",
@@ -421,10 +541,9 @@ class UrukBot:
         )
 
     async def ask_permission(self, topic_id: int, tool_name: str, input_data: dict) -> bool:
-        """Show Allow and Deny buttons for a tool call and wait for the decision."""
+        """Show Allow and Deny buttons and wait indefinitely for the decision."""
         pid = next(self._pid)
         pending = _Pending(kind="perm", future=asyncio.get_running_loop().create_future(), topic_id=topic_id)
-        self.pending[pid] = pending
         summary = _summarize_tool_input(tool_name, input_data)[:1500]
         text = f"🔧 <b>{html.escape(tool_name)}</b>"
         if summary:
@@ -437,11 +556,10 @@ class UrukBot:
                 ],
             ],
         )
-        await self._send(topic_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
-        return await pending.future
+        return await self._wait_for_reply(pid, pending, text, expires_after=None, parse_mode=ParseMode.HTML, reply_markup=markup)
 
     async def ask_question(self, topic_id: int | None, question: dict) -> str:
-        """Show question options and wait for a selected or typed answer."""
+        """Wait for a selected or typed answer, expiring only setup questions in General."""
         pid = next(self._pid)
         options = [option["label"] for option in question.get("options", [])]
         pending = _Pending(
@@ -451,23 +569,18 @@ class UrukBot:
             options=options,
             multi=bool(question.get("multiSelect")),
         )
-        self.pending[pid] = pending
         lines = [f"❓ <b>{html.escape(question.get('header', 'Question'))}</b>", html.escape(question["question"])]
         for option in question.get("options", []):
             description = option.get("description", "")
             lines.append(f"• <b>{html.escape(option['label'])}</b> — {html.escape(description)}")
-        await self._send(
-            topic_id,
+        return await self._wait_for_reply(
+            pid,
+            pending,
             "\n".join(lines),
+            expires_after=self.config.interaction_timeout if self._topic_key(topic_id) is None else None,
             parse_mode=ParseMode.HTML,
             reply_markup=self._question_markup(pid, pending),
         )
-        answer = await pending.future
-        if isinstance(answer, asyncio.Future):
-            # "Other…" was picked: the button handler installed a future that the
-            # user's next message in this topic resolves.
-            answer = await answer
-        return answer
 
     def _question_markup(self, pid: int, pending: _Pending) -> InlineKeyboardMarkup:
         rows = []
@@ -479,16 +592,17 @@ class UrukBot:
         rows.append([InlineKeyboardButton("✍️ Other…", callback_data=f"q:{pid}:other")])
         return InlineKeyboardMarkup(rows)
 
-    async def _send(self, topic_id: int | None, text: str, **kwargs: Any) -> None:
+    async def _send(self, topic_id: int | None, text: str, **kwargs: Any) -> Message | None:
         try:
-            await self._application().bot.send_message(
+            return await self._application().bot.send_message(
                 chat_id=self.config.chat_id,
                 text=text,
-                message_thread_id=topic_id,
+                message_thread_id=self._topic_key(topic_id),
                 **kwargs,
             )
         except TelegramError:
             logger.exception("failed to send message to topic {}", topic_id)
+            return None
 
     # -- button presses ------------------------------------------------------------
 
@@ -516,7 +630,18 @@ class UrukBot:
                 await query.edit_message_reply_markup(None)
             return
 
+        expected_kind = {"perm": "p", "question": "q", "attach": "x", "auto": "a"}.get(pending.kind)
+        if kind != expected_kind or not isinstance(query.message, Message) or self._topic_key(query.message.message_thread_id) != pending.topic_id:
+            await query.answer("Unknown action.")
+            return
+        if self.awaiting_text.get(pending.topic_id) is pending.future:
+            await query.answer("Type your answer, or use /cancel.")
+            return
+
         if kind == "p":
+            if arg not in {"a", "d"}:
+                await query.answer("Unknown action.")
+                return
             allowed = arg == "a"
             del self.pending[pid]
             pending.future.set_result(allowed)
@@ -526,13 +651,16 @@ class UrukBot:
 
         if kind == "q":
             if arg == "other":
-                del self.pending[pid]
-                text_future = asyncio.get_running_loop().create_future()
-                self.awaiting_text[pending.topic_id] = text_future
-                pending.future.set_result(text_future)
+                if pending.topic_id in self.awaiting_text:
+                    await query.answer("Answer the current text question first.")
+                    return
+                self.awaiting_text[pending.topic_id] = pending.future
                 await query.answer()
                 await self._finalize(query, "✍️ Type your answer as a message in this topic.")
             elif arg == "done":
+                if not pending.multi:
+                    await query.answer("Unknown action.")
+                    return
                 labels = [pending.options[index] for index in sorted(pending.selected)]
                 answer = ", ".join(labels) if labels else "(none)"
                 del self.pending[pid]
@@ -540,7 +668,14 @@ class UrukBot:
                 await query.answer()
                 await self._finalize(query, f"→ {answer}")
             else:
-                index = int(arg)
+                try:
+                    index = int(arg)
+                except ValueError:
+                    await query.answer("Unknown option.")
+                    return
+                if not 0 <= index < len(pending.options):
+                    await query.answer("Unknown option.")
+                    return
                 if pending.multi:
                     pending.selected.symmetric_difference_update({index})
                     await query.answer()
@@ -555,7 +690,10 @@ class UrukBot:
 
         if kind == "x":
             try:
-                candidate = pending.payloads[int(arg)]
+                index = int(arg)
+                if index < 0:
+                    raise IndexError  # noqa: TRY301
+                candidate = pending.payloads[index]
             except (IndexError, ValueError):
                 await query.answer("Unknown session.")
                 return
@@ -596,14 +734,11 @@ class UrukBot:
             "id": self._cmd_id,
         }
         if command == "prompt":
-            topic_id = message.message_thread_id
-            dialogue = self.prompt_dialogues.get(topic_id)
-            if dialogue is not None and not dialogue.done():
-                await query.answer("A prompt setup is already in progress.")
+            topic_id = self._topic_key(message.message_thread_id)
+            if self._flow_running(topic_id):
+                await query.answer("Finish the current flow or use /cancel first.")
                 return
-            dialogue = asyncio.create_task(self._run_prompt_dialogue(message, topic_id))
-            self.prompt_dialogues[topic_id] = dialogue
-            dialogue.add_done_callback(lambda task: self._finish_prompt_dialogue(topic_id, task))
+            self._start_flow(self.prompt_dialogues, topic_id, lambda: self._run_prompt_dialogue(message, topic_id))
             await query.answer("Prompt setup started")
             return
         handler = handlers.get(command)
@@ -613,16 +748,6 @@ class UrukBot:
         await query.answer()
         await handler(update, context)
         await self._maybe_show_panel(message.message_thread_id)
-
-    def _finish_prompt_dialogue(self, topic_id: int | None, task: asyncio.Task) -> None:
-        """Release a finished dialogue and make unexpected failures visible in logs."""
-        self.prompt_dialogues.pop(topic_id, None)
-        if task.cancelled():
-            return
-        if error := task.exception():
-            logger.opt(exception=error).error("prompt dialogue in topic {} failed", topic_id)
-            return
-        asyncio.get_running_loop().create_task(self._send_panel(topic_id))
 
     async def _run_prompt_dialogue(self, message: Any, topic_id: int | None) -> None:
         """Collect model, effort, repository, and prompt from the command panel."""
@@ -719,12 +844,23 @@ class UrukBot:
 
     async def _request_dialogue_text(self, topic_id: int | None, text: str) -> str:
         """Ask for one text response in a command-panel dialogue."""
+        topic_id = self._topic_key(topic_id)
         if topic_id in self.awaiting_text:
             raise RuntimeError(f"topic {topic_id} is already awaiting text")
         future = asyncio.get_running_loop().create_future()
         self.awaiting_text[topic_id] = future
-        await self._send(topic_id, text)
-        return await future
+        try:
+            async with asyncio.timeout(self.config.interaction_timeout):
+                if await self._send(topic_id, text) is None:
+                    raise RuntimeError("could not send the text prompt to Telegram")
+                return await future
+        finally:
+            if self.awaiting_text.get(topic_id) is future:
+                self.awaiting_text.pop(topic_id, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
 
     async def _finalize(self, query: Any, suffix: str) -> None:
         """Append the outcome to the prompt message and drop its buttons."""
@@ -736,21 +872,38 @@ class UrukBot:
 
     # -- messages ------------------------------------------------------------------
 
+    async def _on_unknown_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
+        if self._auth(update):
+            await self._message(update).reply_text("Unknown command. Use /help for commands, or /cancel to stop the current flow.")
+
+    async def _on_non_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
+        if self._auth(update):
+            await self._message(update).reply_text("Please send text or choose one of the buttons. Use /cancel to stop the current flow.")
+
     async def _on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
         if not self._auth(update):
             return
         message = self._message(update)
-        topic_id = message.message_thread_id
+        topic_id = self._topic_key(message.message_thread_id)
         if message.text is None:
             return
 
         if topic_id in self.awaiting_text:
             future = self.awaiting_text.pop(topic_id)
             if not future.done():
+                if not message.text.strip():
+                    self.awaiting_text[topic_id] = future
+                    await message.reply_text("Please send a non-empty answer, or use /cancel.")
+                    return
                 future.set_result(message.text)
-            with contextlib.suppress(TelegramError):
-                await message.set_reaction("✍")
-            return
+                with contextlib.suppress(TelegramError):
+                    await message.set_reaction("✍")
+                return
+
+        for pending in self.pending.values():
+            if pending.topic_id == topic_id and not pending.future.done():
+                await message.reply_text("Choose one of the buttons. For a question, use Other… to type an answer. Use /cancel to stop waiting.")
+                return
 
         if topic_id is None:
             await message.reply_text(
@@ -786,10 +939,8 @@ class UrukBot:
 
     async def _maybe_show_panel(self, topic_id: int | None) -> None:
         """Repost the panel, unless a flow in this topic will repost it when it finishes."""
-        for flows in (self.prompt_dialogues, self.auto_runs):
-            flow = flows.get(topic_id)
-            if flow is not None and not flow.done():
-                return
+        if self._flow_running(topic_id):
+            return
         await self._send_panel(topic_id)
 
     async def _send_panel(self, topic_id: int | None) -> None:
@@ -840,6 +991,7 @@ class UrukBot:
             "/auto [N] — offer the next N unreviewed backlog items as new tasks (in General); "
             "the backlog is fetched once and cycles when fully reviewed\n"
             "/interrupt — interrupt the current turn (in a task topic)\n"
+            "/cancel — cancel the current setup, question, approval, or handoff\n"
             "/close — end the session and close the topic (in a task topic)\n"
             "/purge — delete topics closed with /close, and forget sessions whose topics were deleted by hand\n"
             "/model [name|default] — show or change this task's model (in a task topic)\n"
@@ -867,24 +1019,11 @@ class UrukBot:
         if not 1 <= limit <= _AUTO_MAX_LIMIT:
             await message.reply_text(f"Choose between 1 and {_AUTO_MAX_LIMIT} items.")
             return
-        topic_id = message.message_thread_id
-        run = self.auto_runs.get(topic_id)
-        if run is not None and not run.done():
-            await message.reply_text("An automatic backlog run is already in progress.")
+        topic_id = self._topic_key(message.message_thread_id)
+        if self._flow_running(topic_id):
+            await message.reply_text("Finish the current flow or use /cancel first.")
             return
-        run = asyncio.create_task(self._run_auto(message, topic_id, limit))
-        self.auto_runs[topic_id] = run
-        run.add_done_callback(lambda task: self._finish_auto_run(topic_id, task))
-
-    def _finish_auto_run(self, topic_id: int | None, task: asyncio.Task) -> None:
-        """Release a completed automatic backlog run and log unexpected errors."""
-        self.auto_runs.pop(topic_id, None)
-        if task.cancelled():
-            return
-        if error := task.exception():
-            logger.opt(exception=error).error("automatic backlog run in topic {} failed", topic_id)
-            return
-        asyncio.get_running_loop().create_task(self._send_panel(topic_id))
+        self._start_flow(self.auto_runs, topic_id, lambda: self._run_auto(message, topic_id, limit))
 
     async def _run_auto(self, message: Any, topic_id: int | None, limit: int) -> None:
         try:
@@ -942,7 +1081,7 @@ class UrukBot:
                 if self.backlog
                 else "📥 Fetching the complete backlog…",
             )
-            self.backlog = await asyncio.to_thread(self._fetch_backlog_issues)
+            self.backlog = await asyncio.wait_for(asyncio.to_thread(self._fetch_backlog_issues), _DISCOVERY_TIMEOUT)
             self.backlog_started.clear()
             self.backlog_skipped.clear()
             remaining = list(self.backlog)
@@ -961,6 +1100,7 @@ class UrukBot:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=10,
             )
         except FileNotFoundError as error:
             raise RuntimeError("GitHub CLI is not installed.") from error
@@ -1016,7 +1156,6 @@ class UrukBot:
             future=asyncio.get_running_loop().create_future(),
             topic_id=topic_id,
         )
-        self.pending[pid] = pending
         url_part = "pull" if issue.is_pr else "issues"
         url = f"https://github.com/{issue.repository}/{url_part}/{issue.number}"
         text = (
@@ -1024,13 +1163,14 @@ class UrukBot:
             f'<a href="{url}">{html.escape(issue.title)}</a>\n\n'
             "Start a task for this item? Choose a model, or skip it."
         )
-        await self._send(
-            topic_id,
+        return await self._wait_for_reply(
+            pid,
+            pending,
             text,
+            expires_after=self.config.interaction_timeout,
             parse_mode=ParseMode.HTML,
             reply_markup=self._auto_model_markup(pid),
         )
-        return await pending.future
 
     @staticmethod
     def _auto_model_markup(pid: int) -> InlineKeyboardMarkup:
@@ -1053,6 +1193,12 @@ class UrukBot:
         if not self._auth(update):
             return
         message = self._message(update)
+        if not self._is_main_thread(message):
+            await message.reply_text("Start new sessions in the General topic.")
+            return
+        if self._flow_running(message.message_thread_id):
+            await message.reply_text("Finish the current flow or use /cancel first.")
+            return
         if message.text is None:
             return
         command, *args = message.text.split()
@@ -1173,9 +1319,17 @@ class UrukBot:
         if not self._is_main_thread(message):
             await message.reply_text("Use /attach in the General topic.")
             return
+        topic_id = self._topic_key(message.message_thread_id)
+        if self._flow_running(topic_id):
+            await message.reply_text("Finish the current flow or use /cancel first.")
+            return
+        self._start_flow(self._attach_runs, topic_id, lambda: self._run_attach(message, topic_id))
+
+    async def _run_attach(self, message: Message, topic_id: int | None) -> None:
+        """Discover sessions and collect a choice while updates continue to arrive."""
         await message.reply_text("🔎 Looking for local Claude and Codex sessions…")
         try:
-            candidates = await self._discover_attach_candidates()
+            candidates = await asyncio.wait_for(self._discover_attach_candidates(), _DISCOVERY_TIMEOUT)
         except Exception:  # noqa: BLE001
             logger.exception("discovering local sessions failed")
             await message.reply_text("Could not list local sessions; see the Uruk log for details.")
@@ -1183,7 +1337,7 @@ class UrukBot:
         if not candidates:
             await message.reply_text("No untracked local sessions were found.")
             return
-        candidate = await self._choose_attach_candidate(message.message_thread_id, candidates)
+        candidate = await self._choose_attach_candidate(topic_id, candidates)
         if not isinstance(candidate, _AttachCandidate):
             return
         if candidate.status == "active":
@@ -1275,19 +1429,19 @@ class UrukBot:
             topic_id=topic_id,
             payloads=list(candidates),
         )
-        self.pending[pid] = pending
         rows = []
         for index, candidate in enumerate(candidates):
             provider = "Claude" if candidate.provider == "claude" else "Codex"
             status = " · busy" if candidate.status == "active" else ""
             label = f"{provider} · {Path(candidate.repo).name} · {candidate.title}".replace("\n", " ")
             rows.append([InlineKeyboardButton((label[:56] + status)[:64], callback_data=f"x:{pid}:{index}")])
-        await self._send(
-            topic_id,
+        result = await self._wait_for_reply(
+            pid,
+            pending,
             "Choose a local session to attach. Busy sessions stay in their terminal until the current turn ends.",
+            expires_after=self.config.interaction_timeout,
             reply_markup=InlineKeyboardMarkup(rows),
         )
-        result = await pending.future
         return result if isinstance(result, _AttachCandidate) else None
 
     async def _attach_candidate(self, message: Any, candidate: _AttachCandidate) -> None:
@@ -1347,6 +1501,13 @@ class UrukBot:
         if topic_id is None or self.store.get(topic_id) is None:
             await message.reply_text("Use /release inside a task topic.")
             return
+        if self._flow_running(topic_id):
+            await message.reply_text("A handoff is already in progress. Use /cancel to stop it.")
+            return
+        self._start_flow(self._release_runs, topic_id, lambda: self._run_release(message, topic_id))
+
+    async def _run_release(self, message: Message, topic_id: int) -> None:
+        """Release a session without blocking interrupt or cancel commands."""
         try:
             await self._release_to_terminal(topic_id)
         except RuntimeError as error:
@@ -1371,10 +1532,34 @@ class UrukBot:
         task = self.tasks.get(topic_id) if topic_id is not None else None
         if task is None:
             await message.reply_text("Use /interrupt inside an active task topic.")
-        elif await task.interrupt():
-            await message.reply_text("⏹ Interrupt sent.")
         else:
-            await message.reply_text("Nothing is running in this task.")
+            self._cancel_interactions(topic_id)
+            if await task.interrupt():
+                await message.reply_text("⏹ Interrupt sent.")
+            else:
+                await message.reply_text("Nothing is running in this task.")
+
+    async def _cancel_flows(self, topic_id: int | None) -> bool:
+        topic_id = self._topic_key(topic_id)
+        flows = [task for mapping in self._flow_maps() if (task := mapping.get(topic_id)) is not None and not task.done()]
+        for task in flows:
+            task.cancel()
+        if flows:
+            await asyncio.gather(*flows, return_exceptions=True)
+        for mapping in self._flow_maps():
+            if mapping.get(topic_id) in flows:
+                mapping.pop(topic_id, None)
+        return bool(flows)
+
+    async def _cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
+        """Cancel a dialogue or answer wait without closing the session."""
+        if not self._auth(update):
+            return
+        message = self._message(update)
+        topic_id = self._topic_key(message.message_thread_id)
+        cancelled = await self._cancel_flows(topic_id)
+        cancelled = self._cancel_interactions(topic_id) or cancelled
+        await message.reply_text("Cancelled. You can start again." if cancelled else "No interaction is waiting. Use /interrupt to stop an agent turn.")
 
     def _topic_task(self, update: Update) -> AgentTask | None:
         """The task for the topic this command was sent in, or None (with a hint sent)."""
@@ -1535,10 +1720,11 @@ class UrukBot:
             await message.reply_text("Use /close inside a task topic.")
             return
         task = self.tasks.pop(topic_id, None)
+        await self._cancel_flows(topic_id)
+        self._cancel_interactions(topic_id)
         if task is not None:
             await task.close()
         self.store.remove(topic_id)
-        self.awaiting_text.pop(topic_id, None)
         await message.reply_text("Closed.")
         with contextlib.suppress(TelegramError):
             await self._application().bot.close_forum_topic(chat_id=self.config.chat_id, message_thread_id=topic_id)
@@ -1597,10 +1783,11 @@ class UrukBot:
                     logger.warning("could not probe topic {}: {}", info.topic_id, error)
                     continue
                 task = self.tasks.pop(info.topic_id, None)
+                await self._cancel_flows(info.topic_id)
+                self._cancel_interactions(info.topic_id)
                 if task is not None:
                     await task.close()
                 self.store.remove(info.topic_id)
-                self.awaiting_text.pop(info.topic_id, None)
                 orphaned += 1
         return orphaned
 

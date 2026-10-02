@@ -68,6 +68,7 @@ No public endpoint, no open ports: the bot long-polls Telegram.
    | `URUK_MODEL` | no | Default model override passed to the Claude SDK. |
    | `URUK_DATA_DIR` | no | Where session state is persisted (default `~/.local/share/uruk`). |
    | `URUK_REPO_PREFIXES` | no | Comma-separated `owner=prefix` pairs mapping GitHub owners to local directory prefixes for `/auto`, e.g. `mkdocstrings=mkdocstrings-` matches `mkdocstrings/python` to `mkdocstrings-python`. The plain repo name is the fallback, so `mkdocstrings/mkdocstrings` still matches `mkdocstrings`. |
+   | `URUK_INTERACTION_TIMEOUT` | no | Maximum seconds to wait for each setup answer or session handoff (default `300`). Agent questions and approvals have no timeout. Must be a finite positive number. |
 
 6. **Run it**:
 
@@ -96,6 +97,7 @@ runtime. Authenticate the GitHub CLI on the machine running Uruk first.
 | `/release` | a task topic | Wait for the current turn, release the session to a terminal, and show its native resume command. |
 | `/auto [N]` | General | Fetch the first `N` configured Insiders backlog items (default 5), then offer each as a new task with a model-selection button. It uses the active `gh` login and matches GitHub repositories to same-named local directories. |
 | `/interrupt` | a task topic | Interrupt the current agent turn. |
+| `/cancel` | anywhere | Cancel the current setup, question, approval, or handoff. The session stays available. |
 | `/close` | a task topic | End the session and close the topic. |
 | `/purge` | anywhere | Delete all topics previously closed with `/close` (needs the *Delete messages* admin permission). |
 | `/model [name\|default]` | a task topic | Show or change the task's model within its current provider. Switching between Claude and Codex requires a new topic. |
@@ -106,6 +108,16 @@ runtime. Authenticate the GitHub CLI on the machine running Uruk first.
 Claude approval prompts appear as **✅ Allow / ❌ Deny** buttons. The agent's clarifying questions appear
 with one button per option (plus **✍️ Other…** to answer with free text — your next message in the
 topic is taken as the answer).
+
+Prompt, Auto, and Attach run one at a time in General. Finish the current flow, or send `/cancel` before starting another.
+Each unanswered setup interaction expires after five minutes by default.
+Agent questions and approvals inside task topics stay pending indefinitely until you answer or explicitly cancel them. This includes typed answers after **Other…**.
+Setup flows show the command panel again after completion, cancellation, timeout, or failure.
+Text sent while buttons are waiting receives instructions. Photos, voice messages, and other attachments receive a reminder to send text.
+Command and message handlers have a separate 30-second timeout, so a stalled action can release the update dispatcher.
+
+Session handoffs use the same timeout. If a handoff expires or is cancelled, Telegram keeps ownership of the session.
+The timeout applies to setup answer waits and handoffs. Agent turns can continue for longer; use `/interrupt` to stop a turn.
 
 Sessions survive bot restarts: session IDs are persisted, and the first message you send in an old
 topic resumes the conversation with full context.

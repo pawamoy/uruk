@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +50,8 @@ class Config:
     """Directory containing session state and the local control socket."""
     repo_prefixes: dict[str, str]
     """Repository owner names mapped to local directory prefixes."""
+    interaction_timeout: float = 300
+    """Maximum seconds to wait for each setup answer or handoff; agent input waits have no timeout."""
 
     @staticmethod
     def data_dir_from_env() -> Path:
@@ -98,6 +101,13 @@ class Config:
                 raise ConfigError(f"URUK_REPO_PREFIXES entries must look like owner=prefix, got {entry!r}")
             repo_prefixes[owner.strip()] = prefix.strip()
 
+        try:
+            interaction_timeout = float(os.environ.get("URUK_INTERACTION_TIMEOUT", "300"))
+        except ValueError as error:
+            raise ConfigError("URUK_INTERACTION_TIMEOUT must be a positive number of seconds") from error
+        if not math.isfinite(interaction_timeout) or interaction_timeout <= 0:
+            raise ConfigError("URUK_INTERACTION_TIMEOUT must be a positive number of seconds")
+
         return cls(
             token=token,
             chat_id=_int("TELEGRAM_CHAT_ID"),
@@ -107,4 +117,5 @@ class Config:
             model=os.environ.get("URUK_MODEL") or None,
             data_dir=data_dir,
             repo_prefixes=repo_prefixes,
+            interaction_timeout=interaction_timeout,
         )

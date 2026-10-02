@@ -126,6 +126,10 @@ def _summarize_tool_input(tool_name: str, input_data: dict[str, Any]) -> str:
     return json.dumps(input_data, indent=2, ensure_ascii=False, default=str)
 
 
+class _InteractionCancelledError(RuntimeError):
+    """The user cancelled a Telegram answer wait."""
+
+
 class ClaudeAgentTask:
     """One live Claude session bound to a repository and a Telegram topic."""
 
@@ -286,8 +290,12 @@ class ClaudeAgentTask:
         # The agent's clarifying questions route through the same permission channel.
         if tool_name == "AskUserQuestion":
             answers: dict[str, str] = {}
-            for question in (input_data or {}).get("questions", []):
-                answers[question["question"]] = await self.ui.ask_question(self.info.topic_id, question)
+            try:
+                for question in (input_data or {}).get("questions", []):
+                    answers[question["question"]] = await self.ui.ask_question(self.info.topic_id, question)
+            except _InteractionCancelledError:
+                await self.ui.send_activity(self.info.topic_id, "⏹ Question cancelled. Ask again when needed.")
+                return PermissionResultDeny(message="The user did not answer. Do not assume an answer; ask again when needed.")
             return PermissionResultAllow(updated_input={**input_data, "answers": answers})
 
         allowed = await self.ui.ask_permission(self.info.topic_id, tool_name, input_data or {})

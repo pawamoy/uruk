@@ -71,9 +71,10 @@ _MODEL_COMMANDS = {
     "opus": ("claude", "opus"),
     "sonnet": ("claude", "sonnet"),
     "haiku": ("claude", "haiku"),
-    "sol": ("openai", "gpt-5.6-sol"),
+    "astra": ("openai", "gpt-6-astra"),
+    "sol": ("openai", "gpt-6.1-sol"),
     "terra": ("openai", "gpt-5.6-terra"),
-    "luna": ("openai", "gpt-5.6-luna"),
+    "luna": ("openai", "gpt-6-luna"),
 }
 _MODEL_LABELS = {model: command for command, (_, model) in _MODEL_COMMANDS.items()}
 _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
@@ -983,7 +984,7 @@ class UrukBot:
         if not self._auth(update):
             return
         await self._message(update).reply_text(
-            "/<fable|opus|sonnet|haiku|sol|terra|luna> [--<effort>] <repo> [task…] — start a session\n"
+            "/<fable|opus|sonnet|haiku|astra|sol|terra|luna> [--<effort>] <repo> [task…] — start a session\n"
             "/repos — list repositories\n"
             "/list — list sessions\n"
             "/attach — attach an idle local Claude or Codex session (in General)\n"
@@ -1183,7 +1184,7 @@ class UrukBot:
         if not self._auth(update):
             return
         await self._message(update).reply_text(
-            "Use /<fable|opus|sonnet|haiku|sol|terra|luna> "
+            "Use /<fable|opus|sonnet|haiku|astra|sol|terra|luna> "
             "[--low|--medium|--high|--xhigh|--max] "
             "<repo> [first prompt…].\n"
             "For example: /fable --max myrepo Fix the failing tests",

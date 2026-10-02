@@ -81,6 +81,30 @@ async def _answer(bot: UrukBot, answer: str, topic_id: int | None = 42) -> None:
     await bot._on_button(_button(bot, f"q:{pid}:{answer}", topic_id), MagicMock())
 
 
+@pytest.mark.parametrize(
+    ("command", "expected_model"),
+    [
+        ("astra", "gpt-6-astra"),
+        ("sol", "gpt-6.1-sol"),
+        ("luna", "gpt-6-luna"),
+    ],
+)
+def test_codex_model_commands_start_latest_models(bot: UrukBot, command: str, expected_model: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        repo = bot.config.data_dir / "project"
+        repo.mkdir()
+        started = AsyncMock()
+        monkeypatch.setattr(bot, "_start_session", started)
+
+        await bot._cmd_new_model(_update(bot, f"/{command} project Review this diff", 1), MagicMock())
+
+        started.assert_awaited_once()
+        assert started.await_args is not None
+        assert started.await_args.args[1:3] == ("openai", expected_model)
+
+    asyncio.run(scenario())
+
+
 def test_attach_handler_returns_before_the_selection(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         candidate = _AttachCandidate("claude", "session", str(bot.config.data_dir), "task")

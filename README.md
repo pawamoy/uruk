@@ -39,7 +39,7 @@ No public endpoint, no open ports: the bot long-polls Telegram.
 ## Requirements
 
 - The `claude` CLI installed and logged in for Claude sessions.
-- Codex logged in (`uv run codex login`) for Sol, Terra, and Luna sessions. The Python package includes
+- Codex logged in (`uv run codex login`) for Astra, Sol, Terra, and Luna sessions. The Python package includes
   its own compatible Codex runtime.
 - A Telegram bot token and a private group with topics enabled (setup below).
 - Python ≥ 3.12 and [uv](https://docs.astral.sh/uv/) (or pip).
@@ -90,7 +90,7 @@ runtime. Authenticate the GitHub CLI on the machine running Uruk first.
 
 | Command | Where | Effect |
 |---|---|---|
-| `/<model> [--<effort>] <repo> [task…]` | General | Start a Claude session with `fable`, `opus`, `sonnet`, or `haiku`, or a Codex session with `sol`, `terra`, or `luna`, in `<repo>` (absolute path, or relative to `URUK_REPOS_ROOT`). Effort is optionally `--low`, `--medium`, `--high`, `--xhigh`, or `--max`; the rest of the line is the first prompt. Examples: `/fable --max myrepo Fix the tests`, `/terra --high myrepo Review this diff`. |
+| `/<model> [--<effort>] <repo> [task…]` | General | Start a Claude session with `fable`, `opus`, `sonnet`, or `haiku`, or a Codex session with `astra`, `sol`, `terra`, or `luna`, in `<repo>` (absolute path, or relative to `URUK_REPOS_ROOT`). Effort is optionally `--low`, `--medium`, `--high`, `--xhigh`, or `--max`; the rest of the line is the first prompt. Examples: `/fable --max myrepo Fix the tests`, `/astra --high myrepo Review this diff`. |
 | `/repos` | General | List directories under `URUK_REPOS_ROOT`. |
 | `/list` | General | List active and resumable sessions. |
 | `/attach` | General | List recent local Claude and Codex sessions and attach an idle one to a new task topic. |

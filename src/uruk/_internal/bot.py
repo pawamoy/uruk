@@ -27,6 +27,7 @@ import inspect
 import itertools
 import json
 import logging
+import os
 import secrets
 import subprocess
 import sys
@@ -176,6 +177,8 @@ class UrukBot:
         """Background tasks working through backlog issues."""
         self._attach_runs: dict[int | None, asyncio.Task] = {}
         self._release_runs: dict[int | None, asyncio.Task] = {}
+        self._restart_runs: dict[int | None, asyncio.Task] = {}
+        self._restart_requested = False
         self._shutting_down = False
         self.control_server: asyncio.AbstractServer | None = None
         """Local server used to hand sessions to terminal clients."""
@@ -205,6 +208,7 @@ class UrukBot:
             ("release", self._cmd_release),
             ("interrupt", self._cmd_interrupt),
             ("cancel", self._cmd_cancel),
+            ("restart", self._cmd_restart),
             ("close", self._cmd_close),
             ("purge", self._cmd_purge),
             ("auto", self._cmd_auto),
@@ -271,7 +275,7 @@ class UrukBot:
         return None if topic_id == 1 else topic_id
 
     def _flow_maps(self) -> tuple[dict[int | None, asyncio.Task], ...]:
-        return self.prompt_dialogues, self.auto_runs, self._attach_runs, self._release_runs
+        return self.prompt_dialogues, self.auto_runs, self._attach_runs, self._release_runs, self._restart_runs
 
     def _flow_running(self, topic_id: int | None) -> bool:
         topic_id = self._topic_key(topic_id)
@@ -344,6 +348,18 @@ class UrukBot:
     def _control_socket_path(self) -> Path:
         """The local-only control socket used by ``uruk resume``."""
         return self.config.data_dir / "control.sock"
+
+    def _restart_marker_path(self) -> Path:
+        """Return the marker used to confirm a completed remote restart."""
+        return self.config.data_dir / "restart-requested"
+
+    async def startup(self, app: Application) -> None:
+        """Start local services and report a completed remote restart."""
+        await self.start_control_server(app)
+        marker = self._restart_marker_path()
+        if marker.exists() and await self._send(None, "✅ Uruk restarted successfully.") is not None:
+            with contextlib.suppress(OSError):
+                marker.unlink()
 
     async def start_control_server(self, app: Application) -> None:  # noqa: ARG002
         """Accept local requests to hand a Telegram session to a terminal.
@@ -993,6 +1009,7 @@ class UrukBot:
             "the backlog is fetched once and cycles when fully reviewed\n"
             "/interrupt — interrupt the current turn (in a task topic)\n"
             "/cancel — cancel the current setup, question, approval, or handoff\n"
+            "/restart — restart Uruk from the General topic\n"
             "/close — end the session and close the topic (in a task topic)\n"
             "/purge — delete topics closed with /close, and forget sessions whose topics were deleted by hand\n"
             "/model [name|default] — show or change this task's model (in a task topic)\n"
@@ -1562,6 +1579,63 @@ class UrukBot:
         cancelled = self._cancel_interactions(topic_id) or cancelled
         await message.reply_text("Cancelled. You can start again." if cancelled else "No interaction is waiting. Use /interrupt to stop an agent turn.")
 
+    async def _cmd_restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG002
+        """Ask for confirmation before restarting Uruk from the General topic."""
+        if not self._auth(update):
+            return
+        message = self._message(update)
+        if not self._is_main_thread(message):
+            await message.reply_text("Use /restart in the General topic.")
+            return
+        topic_id = self._topic_key(message.message_thread_id)
+        if self._flow_running(topic_id):
+            await message.reply_text("Finish the current flow or use /cancel first.")
+            return
+        self._start_flow(self._restart_runs, topic_id, lambda: self._run_restart(message, topic_id))
+
+    async def _run_restart(self, message: Message, topic_id: int | None) -> None:
+        """Confirm the restart, optionally waiting for active turns to finish."""
+        active = [task for task in self.tasks.values() if task.turn_running]
+        if active:
+            answer = await self.ask_question(
+                topic_id,
+                {
+                    "header": "Restart Uruk",
+                    "question": f"{len(active)} agent turn{'s are' if len(active) != 1 else ' is'} still running.",
+                    "options": [
+                        {"label": "Wait and restart", "description": "Finish active turns before restarting."},
+                        {"label": "Restart now", "description": "Interrupt active turns and restart immediately."},
+                        {"label": "Cancel", "description": "Keep Uruk running."},
+                    ],
+                },
+            )
+            if answer == "Wait and restart":
+                await message.reply_text("Waiting for active turns to finish. Use /cancel to keep Uruk running.")
+                while any(task.turn_running for task in self.tasks.values()):  # noqa: ASYNC110
+                    await asyncio.sleep(0.25)
+            elif answer != "Restart now":
+                return
+        else:
+            answer = await self.ask_question(
+                topic_id,
+                {
+                    "header": "Restart Uruk",
+                    "question": "Restart Uruk now?",
+                    "options": [
+                        {"label": "Restart", "description": "Restart Uruk now."},
+                        {"label": "Cancel", "description": "Keep Uruk running."},
+                    ],
+                },
+            )
+            if answer != "Restart":
+                return
+
+        await message.reply_text("♻️ Restarting Uruk…")
+        self._restart_marker_path().touch()
+        self._restart_requested = True
+        self._shutting_down = True
+        self._application().stop_running()
+
     def _topic_task(self, update: Update) -> AgentTask | None:
         """The task for the topic this command was sent in, or None (with a hint sent)."""
         topic_id = self._message(update).message_thread_id
@@ -1822,7 +1896,7 @@ def _run_bot() -> None:
     app = (
         Application.builder()
         .token(config.token)
-        .post_init(bot.start_control_server)
+        .post_init(bot.startup)
         .post_shutdown(bot.shutdown)
         .build()
     )
@@ -1838,3 +1912,6 @@ def _run_bot() -> None:
     else:
         logger.warning("TELEGRAM_CHAT_ID / TELEGRAM_OWNER_ID not set — setup mode: only /id will respond.")
     app.run_polling(allowed_updates=["message", "callback_query"])
+    if bot._restart_requested:
+        # Re-exec only after run_polling completes its graceful shutdown.
+        os.execv(sys.executable, [sys.executable, "-m", "uruk"])  # noqa: S606

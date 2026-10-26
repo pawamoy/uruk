@@ -81,6 +81,106 @@ async def _answer(bot: UrukBot, answer: str, topic_id: int | None = 42) -> None:
     await bot._on_button(_button(bot, f"q:{pid}:{answer}", topic_id), MagicMock())
 
 
+def test_restart_from_general_reexecutes_after_graceful_shutdown(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        stop_running = MagicMock()
+        monkeypatch.setattr(bot._application(), "stop_running", stop_running)
+
+        await bot._cmd_restart(_update(bot, "/restart", 1), MagicMock())
+        await _answer(bot, "0", None)
+        await _wait_until(lambda: bot._restart_requested)
+
+        assert bot._restart_marker_path().exists()
+        stop_running.assert_called_once_with()
+        texts = [call.kwargs["text"] for call in bot._application().bot.send_message.await_args_list]
+        assert "♻️ Restarting Uruk…" in texts
+
+    asyncio.run(scenario())
+
+
+def test_restart_can_wait_for_active_turns(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        task = MagicMock(turn_running=True)
+        bot.tasks[42] = task
+        stop_running = MagicMock()
+        monkeypatch.setattr(bot._application(), "stop_running", stop_running)
+
+        await bot._cmd_restart(_update(bot, "/restart", 1), MagicMock())
+        await _answer(bot, "0", None)
+        await _wait_until(
+            lambda: any(
+                call.kwargs["text"].startswith("Waiting for active turns")
+                for call in bot._application().bot.send_message.await_args_list
+            ),
+        )
+
+        stop_running.assert_not_called()
+        task.turn_running = False
+        await _wait_until(lambda: bot._restart_requested)
+
+        stop_running.assert_called_once_with()
+
+    asyncio.run(scenario())
+
+
+def test_restart_can_stop_active_turns_immediately(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        bot.tasks[42] = MagicMock(turn_running=True)
+        stop_running = MagicMock()
+        monkeypatch.setattr(bot._application(), "stop_running", stop_running)
+
+        await bot._cmd_restart(_update(bot, "/restart", 1), MagicMock())
+        await _answer(bot, "1", None)
+        await _wait_until(lambda: bot._restart_requested)
+
+        stop_running.assert_called_once_with()
+
+    asyncio.run(scenario())
+
+
+def test_restart_is_only_available_in_general(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        stop_running = MagicMock()
+        monkeypatch.setattr(bot._application(), "stop_running", stop_running)
+
+        await bot._cmd_restart(_update(bot, "/restart", 42), MagicMock())
+
+        stop_running.assert_not_called()
+        assert bot._application().bot.send_message.await_args.kwargs["text"] == "Use /restart in the General topic."
+
+    asyncio.run(scenario())
+
+
+def test_startup_reports_a_completed_restart(bot: UrukBot) -> None:
+    async def scenario() -> None:
+        bot._restart_marker_path().touch()
+
+        await bot.startup(bot._application())
+
+        assert not bot._restart_marker_path().exists()
+        assert bot._application().bot.send_message.await_args.kwargs["text"] == "✅ Uruk restarted successfully."
+        await bot.shutdown(bot._application())
+
+    asyncio.run(scenario())
+
+
+def test_run_bot_reexecutes_when_restart_was_requested(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
+    restarted_bot = MagicMock(_restart_requested=True)
+    app = MagicMock()
+    builder = MagicMock()
+    builder.token.return_value.post_init.return_value.post_shutdown.return_value.build.return_value = app
+    execv = MagicMock()
+    monkeypatch.setattr(bot_module.Config, "from_env", lambda: bot.config)
+    monkeypatch.setattr(bot_module, "UrukBot", lambda config: restarted_bot)
+    monkeypatch.setattr(bot_module.Application, "builder", lambda: builder)
+    monkeypatch.setattr(bot_module.os, "execv", execv)
+
+    bot_module._run_bot()
+
+    app.run_polling.assert_called_once_with(allowed_updates=["message", "callback_query"])
+    execv.assert_called_once_with(bot_module.sys.executable, [bot_module.sys.executable, "-m", "uruk"])
+
+
 @pytest.mark.parametrize(
     ("command", "expected_model"),
     [

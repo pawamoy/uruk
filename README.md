@@ -98,6 +98,7 @@ runtime. Authenticate the GitHub CLI on the machine running Uruk first.
 | `/auto [N]` | General | Fetch the first `N` configured Insiders backlog items (default 5), then offer each as a new task with a model-selection button. It uses the active `gh` login and matches GitHub repositories to same-named local directories. |
 | `/interrupt` | a task topic | Interrupt the current agent turn. |
 | `/cancel` | anywhere | Cancel the current setup, question, approval, or handoff. The session stays available. |
+| `/restart` | General | Restart Uruk. You can wait for active agent turns or interrupt them. |
 | `/close` | a task topic | End the session and close the topic. |
 | `/purge` | anywhere | Delete all topics previously closed with `/close` (needs the *Delete messages* admin permission). |
 | `/model [name\|default]` | a task topic | Show or change the task's model within its current provider. Switching between Claude and Codex requires a new topic. |

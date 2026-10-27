@@ -195,19 +195,18 @@ class CodexAgentTask:
         return getattr(item, "root", item)
 
     async def _handle_item_started(self, item: Any) -> None:
+        # Tool events can arrive in bursts. Keep their details in debug logs;
+        # the typing indicator and agent's own messages provide progress in Telegram.
         kind = getattr(item, "type", None)
         if kind == "commandExecution":
             command = getattr(item, "command", "")
             first_line = command.splitlines()[0][:180] if command else ""
-            await self.ui.send_activity(self.info.topic_id, f"⚙️ Bash: {first_line}")
+            logger.debug("topic {}: Bash: {}", self.info.topic_id, first_line)
         elif kind == "mcpToolCall":
             name = f"{getattr(item, 'server', 'MCP')}.{getattr(item, 'tool', 'tool')}"
-            await self.ui.send_activity(self.info.topic_id, f"⚙️ {name}")
+            logger.debug("topic {}: {}", self.info.topic_id, name)
         elif kind == "dynamicToolCall":
-            await self.ui.send_activity(
-                self.info.topic_id,
-                f"⚙️ {getattr(item, 'tool', 'tool')}",
-            )
+            logger.debug("topic {}: {}", self.info.topic_id, getattr(item, "tool", "tool"))
 
     async def _handle_item_completed(self, item: Any) -> None:
         kind = getattr(item, "type", None)
@@ -218,7 +217,7 @@ class CodexAgentTask:
         elif kind == "fileChange":
             paths = [getattr(change, "path", "") for change in getattr(item, "changes", [])]
             summary = ", ".join(path for path in paths if path)[:180] or "files changed"
-            await self.ui.send_activity(self.info.topic_id, f"⚙️ Edit: {summary}")
+            logger.debug("topic {}: Edit: {}", self.info.topic_id, summary)
 
     async def _handle_turn_completed(self, turn: Any) -> None:
         if turn is None:

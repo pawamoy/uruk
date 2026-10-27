@@ -46,7 +46,7 @@ from loguru import logger
 from openai_codex import AsyncCodex, CodexConfig
 from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -61,6 +61,7 @@ from telegramify_markdown.content import File, Photo, Text
 from uruk._internal.agent import AgentTask, ClaudeAgentTask, _InteractionCancelledError, _summarize_tool_input
 from uruk._internal.codex_agent import CodexAgentTask
 from uruk._internal.config import Config, ConfigError
+from uruk._internal.rate_limiter import _TelegramRateLimiter
 from uruk._internal.store import SessionStore, TaskInfo
 from uruk._internal.worktrees import _prepare_worktree
 
@@ -516,10 +517,14 @@ class UrukBot:
         for box in boxes:
             try:
                 await self._send_box(topic_id, box)
-            except TelegramError:
-                logger.opt(exception=True).warning("sending {} to topic {} failed", type(box).__name__, topic_id)
+            except BadRequest as error:
+                logger.warning("sending {} to topic {} failed: {}", type(box).__name__, topic_id, error)
                 if isinstance(box, Text):
                     await self._send(topic_id, box.text)
+            except TelegramError as error:
+                # A timeout can follow successful delivery. Resending plain text
+                # here would risk sending the same response twice.
+                logger.warning("sending {} to topic {} failed: {}", type(box).__name__, topic_id, error)
 
     async def _send_box(self, topic_id: int, box: Text | File | Photo) -> None:
         if isinstance(box, Text):
@@ -619,8 +624,8 @@ class UrukBot:
                 message_thread_id=self._topic_key(topic_id),
                 **kwargs,
             )
-        except TelegramError:
-            logger.exception("failed to send message to topic {}", topic_id)
+        except TelegramError as error:
+            logger.warning("failed to send message to topic {}: {}", topic_id, error)
             return None
 
     # -- button presses ------------------------------------------------------------
@@ -1911,6 +1916,11 @@ def _run_bot() -> None:
     app = (
         Application.builder()
         .token(config.token)
+        .rate_limiter(_TelegramRateLimiter())
+        .read_timeout(30)
+        .write_timeout(30)
+        .connect_timeout(10)
+        .pool_timeout(10)
         .post_init(bot.startup)
         .post_shutdown(bot.shutdown)
         .build()

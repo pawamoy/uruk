@@ -28,13 +28,21 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+from claude_agent_sdk import (
+    AssistantMessage,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ResultMessage,
+    TextBlock,
+    ToolUseBlock,
+)
 from insiders import Issue
 from telegram import CallbackQuery, Chat, Message, MessageEntity, Update, User
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError, TimedOut
 from telegram.ext import Application
+from telegramify_markdown.content import ContentTrace, Text
 
-from uruk import ClaudeAgentTask, Config, ConfigError, TaskInfo, UrukBot
+from uruk import ClaudeAgentTask, CodexAgentTask, Config, ConfigError, TaskInfo, UrukBot
 from uruk._internal import bot as bot_module
 from uruk._internal.agent import _InteractionCancelledError
 from uruk._internal.bot import _AttachCandidate
@@ -169,7 +177,15 @@ def test_run_bot_reexecutes_when_restart_was_requested(bot: UrukBot, monkeypatch
     restarted_bot = MagicMock(_restart_requested=True)
     app = MagicMock()
     builder = MagicMock()
-    builder.token.return_value.post_init.return_value.post_shutdown.return_value.build.return_value = app
+    builder.token.return_value = builder
+    builder.rate_limiter.return_value = builder
+    builder.read_timeout.return_value = builder
+    builder.write_timeout.return_value = builder
+    builder.connect_timeout.return_value = builder
+    builder.pool_timeout.return_value = builder
+    builder.post_init.return_value = builder
+    builder.post_shutdown.return_value = builder
+    builder.build.return_value = app
     execv = MagicMock()
     monkeypatch.setattr(bot_module.Config, "from_env", lambda: bot.config)
     monkeypatch.setattr(bot_module, "UrukBot", lambda config: restarted_bot)
@@ -179,6 +195,8 @@ def test_run_bot_reexecutes_when_restart_was_requested(bot: UrukBot, monkeypatch
     bot_module._run_bot()
 
     app.run_polling.assert_called_once_with(allowed_updates=["message", "callback_query"])
+    assert isinstance(builder.rate_limiter.call_args.args[0], bot_module._TelegramRateLimiter)
+    builder.read_timeout.assert_called_once_with(30)
     execv.assert_called_once_with(bot_module.sys.executable, [bot_module.sys.executable, "-m", "uruk"])
 
 
@@ -429,6 +447,28 @@ def test_send_failure_does_not_leave_a_waiter(bot: UrukBot, text_only: bool) -> 
     asyncio.run(scenario())
 
 
+def test_formatted_message_timeout_is_not_resent(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A timeout can occur after Telegram has already delivered the response.
+    box = Text(text="Answer", entities=[], content_trace=ContentTrace(source_type="text"))
+    monkeypatch.setattr(bot_module, "telegramify", AsyncMock(return_value=[box]))
+    bot._application().bot.send_message.side_effect = TimedOut
+
+    asyncio.run(bot.send_text(42, "Answer"))
+
+    bot._application().bot.send_message.assert_awaited_once()
+
+
+def test_rejected_formatting_falls_back_to_plain_text(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
+    box = Text(text="Answer", entities=[], content_trace=ContentTrace(source_type="text"))
+    monkeypatch.setattr(bot_module, "telegramify", AsyncMock(return_value=[box]))
+    bot._application().bot.send_message.side_effect = [BadRequest("can't parse entities"), _message(bot, "Answer", 42)]
+
+    asyncio.run(bot.send_text(42, "Answer"))
+
+    assert bot._application().bot.send_message.await_count == 2
+    assert "entities" not in bot._application().bot.send_message.await_args.kwargs
+
+
 def test_prompt_timeout_restores_the_command_panel(bot: UrukBot) -> None:
     async def scenario() -> None:
         bot.config = replace(bot.config, interaction_timeout=0.01)
@@ -612,6 +652,66 @@ def test_claude_does_not_invent_an_answer_when_a_question_is_cancelled(bot: Uruk
 
         assert isinstance(result, PermissionResultDeny)
         assert "Do not assume an answer" in result.message
+
+    asyncio.run(scenario())
+
+
+def test_claude_tool_bursts_leave_progress_answers_and_errors_visible(bot: UrukBot) -> None:
+    async def scenario() -> None:
+        agent = ClaudeAgentTask(bot, TaskInfo(42, str(bot.config.data_dir), "task"), permission_mode="default", default_model=None, on_state_change=lambda: None)
+
+        await agent._handle_message(AssistantMessage(content=[TextBlock("Checking the tests.")], model="sonnet"))
+
+        # Repeated commands and edits must not add messages between written updates.
+        for _ in range(10):
+            await agent._handle_message(AssistantMessage(content=[
+                ToolUseBlock(id="bash", name="Bash", input={"command": "pytest"}),
+                ToolUseBlock(id="edit", name="Edit", input={"file_path": "app.py"}),
+                ToolUseBlock(id="write", name="Write", input={"file_path": "test_app.py"}),
+                ToolUseBlock(id="notebook", name="NotebookEdit", input={"notebook_path": "analysis.ipynb"}),
+            ], model="sonnet"))
+
+        await agent._handle_message(AssistantMessage(content=[TextBlock("The tests pass.")], model="sonnet"))
+
+        texts = [call.kwargs["text"] for call in bot._application().bot.send_message.await_args_list]
+        assert texts == ["Checking the tests.", "The tests pass."]
+
+        # Error notices still reach Telegram even though routine activity is silent.
+        await agent._handle_message(ResultMessage(subtype="error_during_execution", duration_ms=0, duration_api_ms=0, is_error=True, num_turns=1, session_id="session"))
+
+        assert "turn ended with error" in bot._application().bot.send_message.await_args.kwargs["text"]
+
+    asyncio.run(scenario())
+
+
+def test_codex_tool_bursts_leave_progress_answers_and_errors_visible(bot: UrukBot) -> None:
+    async def scenario() -> None:
+        agent = CodexAgentTask(bot, TaskInfo(42, str(bot.config.data_dir), "task", provider="openai"), on_state_change=lambda: None)
+
+        await agent._handle_event(MagicMock(method="item/completed", payload=SimpleNamespace(item=SimpleNamespace(type="agentMessage", text="Checking the tests."))))
+
+        # Command, MCP, dynamic-tool, and file-change events stay out of the topic.
+        items = [
+            ("item/started", SimpleNamespace(type="commandExecution", command="pytest")),
+            ("item/started", SimpleNamespace(type="mcpToolCall", server="tools", tool="search")),
+            ("item/started", SimpleNamespace(type="dynamicToolCall", tool="apply_patch")),
+            ("item/completed", SimpleNamespace(type="fileChange", changes=[SimpleNamespace(path="app.py")])),
+        ]
+        for _ in range(10):
+            for method, item in items:
+                await agent._handle_event(MagicMock(method=method, payload=SimpleNamespace(item=item)))
+
+        await agent._handle_event(MagicMock(method="item/completed", payload=SimpleNamespace(item=SimpleNamespace(type="agentMessage", text="The tests pass."))))
+
+        texts = [call.kwargs["text"] for call in bot._application().bot.send_message.await_args_list]
+        assert texts == ["Checking the tests.", "The tests pass."]
+
+        # Failures and interruptions must remain visible.
+        await agent._handle_event(MagicMock(method="turn/completed", payload=SimpleNamespace(turn=SimpleNamespace(status=SimpleNamespace(value="failed"), error=SimpleNamespace(message="test failure")))))
+        assert "turn failed: test failure" in bot._application().bot.send_message.await_args.kwargs["text"]
+
+        await agent._handle_event(MagicMock(method="turn/completed", payload=SimpleNamespace(turn=SimpleNamespace(status=SimpleNamespace(value="interrupted")))))
+        assert "interrupted" in bot._application().bot.send_message.await_args.kwargs["text"]
 
     asyncio.run(scenario())
 

@@ -116,6 +116,8 @@ Claude approval prompts appear as **✅ Allow / ❌ Deny** buttons. The agent's 
 with one button per option (plus **✍️ Other…** to answer with free text — your next message in the
 topic is taken as the answer).
 
+Task topics show the agent's written progress updates and answers, questions, approvals, and errors. Routine command, file-edit, and tool-call notices stay in debug logs. A typing indicator shows when the agent is working.
+
 Prompt, Auto, and Attach run one at a time in General. Finish the current flow, or send `/cancel` before starting another.
 Each unanswered setup interaction expires after five minutes by default.
 Agent questions and approvals inside task topics stay pending indefinitely until you answer or explicitly cancel them. This includes typed answers after **Other…**.

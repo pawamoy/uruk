@@ -47,9 +47,9 @@ if TYPE_CHECKING:
 
     from uruk._internal.store import TaskInfo
 
-# Tools whose (auto-approved) use is worth a one-line notice in the topic.
-# Reads and searches stay silent; anything that needs approval shows up as a prompt anyway.
-_SHOWN_TOOLS = {"Bash", "Edit", "Write", "NotebookEdit"}
+# Routine tool details stay in debug logs to keep topics readable and save
+# Telegram's message budget. Tools that need approval still show a prompt.
+_LOGGED_TOOLS = {"Bash", "Edit", "Write", "NotebookEdit"}
 
 
 class UI(Protocol):
@@ -270,10 +270,10 @@ class ClaudeAgentTask:
             for block in message.content:
                 if isinstance(block, TextBlock) and block.text.strip():
                     await self.ui.send_text(self.info.topic_id, block.text)
-                elif isinstance(block, ToolUseBlock) and block.name in _SHOWN_TOOLS:
+                elif isinstance(block, ToolUseBlock) and block.name in _LOGGED_TOOLS:
                     summary = _summarize_tool_input(block.name, block.input)
                     first_line = summary.splitlines()[0][:180] if summary else ""
-                    await self.ui.send_activity(self.info.topic_id, f"⚙️ {block.name}: {first_line}")
+                    logger.debug("topic {}: {}: {}", self.info.topic_id, block.name, first_line)
         elif isinstance(message, ResultMessage):
             if message.session_id and message.session_id != self.info.session_id:
                 self.info.session_id = message.session_id

@@ -49,10 +49,12 @@ def test_concurrent_topics_share_the_group_budget(clock: _Clock, endpoint: str) 
         results = await asyncio.gather(
             limiter.process_request(send, (), {}, "sendMessage", {"chat_id": -123, "message_thread_id": 42}, None),
             limiter.process_request(send, (), {}, endpoint, {"chat_id": -123, "message_thread_id": 99}, None),
+            limiter.process_request(send, (), {}, "sendMessage", {"chat_id": -123, "message_thread_id": 42}, None),
+            limiter.process_request(send, (), {}, endpoint, {"chat_id": -123, "message_thread_id": 99}, None),
         )
 
-        assert results == [True, True]
-        assert sent_at == pytest.approx([100, 103.1])
+        assert results == [True, True, True, True]
+        assert sent_at == pytest.approx([100, 100, 100, 101.1])
 
     asyncio.run(scenario())
 
@@ -69,10 +71,32 @@ def test_message_replies_use_the_same_limiter_as_direct_sends(clock: _Clock, mon
         # Stub the transport so real ExtBot and Message methods run without a network.
         monkeypatch.setattr(type(bot.request), "post", post)
         message = await bot.send_message(chat_id=-123, text="Answer", message_thread_id=42)
-        reply = await message.reply_text("Reply")
+        for _ in range(3):
+            reply = await message.reply_text("Reply")
 
         assert reply.message_thread_id == 42
-        assert sent_at == pytest.approx([100, 103.1])
+        assert sent_at == pytest.approx([100, 100, 100, 101.1])
+
+    asyncio.run(scenario())
+
+
+def test_short_bursts_still_respect_the_rolling_group_limit(clock: _Clock) -> None:
+    async def scenario() -> None:
+        limiter = _TelegramRateLimiter()
+        sent_at = []
+
+        async def send() -> bool:
+            sent_at.append(clock.now)
+            return True
+
+        # Exhaust a minute's budget, then continue far enough to test its expiry.
+        for index in range(45):
+            await limiter.process_request(send, (), {}, "sendMessage", {"chat_id": -123, "message_thread_id": index % 2}, None)
+
+        assert sent_at[:3] == [100, 100, 100]
+        assert sent_at[20] == pytest.approx(160.1)
+        for previous, current in zip(sent_at, sent_at[20:], strict=False):
+            assert current - previous >= 60
 
     asyncio.run(scenario())
 

@@ -504,6 +504,42 @@ def test_auto_timeout_does_not_skip_the_unanswered_issue(bot: UrukBot, monkeypat
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("confirmation_fails", [False, True])
+def test_auto_skip_shows_the_next_issue_without_duplicate_edits(bot: UrukBot, monkeypatch: pytest.MonkeyPatch, confirmation_fails: bool) -> None:
+    async def scenario() -> None:
+        issues: list[Issue] = [MagicMock(spec=Issue, repository="owner/project", number=number, title=f"Issue {number}", is_pr=False) for number in (1, 2)]
+        bot.backlog = issues
+        monkeypatch.setattr(bot, "_next_backlog_items", AsyncMock(return_value=issues))
+        monkeypatch.setattr(bot, "_repo_for_backlog_issue", lambda issue: bot.config.data_dir)
+        if confirmation_fails:
+            bot._application().bot.edit_message_text.side_effect = TelegramError("edit failed")
+
+        await bot._cmd_auto(_update(bot, "/auto", 1), MagicMock(args=[]))
+        flow = bot.auto_runs[None]
+        await _wait_until(lambda: bool(bot.pending))
+        first_pid = next(iter(bot.pending))
+
+        await bot._on_button(_button(bot, f"a:{first_pid}:skip", 1), MagicMock())
+        await _wait_until(lambda: bool(bot.pending) and first_pid not in bot.pending)
+
+        texts = [call.kwargs["text"] for call in bot._application().bot.send_message.await_args_list]
+        assert "owner/project#2" in texts[-1]
+        assert bot.backlog_skipped == {"owner/project#1"}
+        bot._application().bot.edit_message_text.assert_awaited_once()
+
+        # Only a failed confirmation needs a separate button-removal request.
+        assert bot._application().bot.edit_message_reply_markup.await_count == int(confirmation_fails)
+
+        second_pid = next(iter(bot.pending))
+        await bot._on_button(_button(bot, f"a:{second_pid}:skip", 1), MagicMock())
+        await flow
+
+        assert not bot.pending
+        assert bot.backlog_skipped == {"owner/project#1", "owner/project#2"}
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("is_pr", [False, True])
 @pytest.mark.parametrize("started", [False, True])
 def test_auto_tracks_only_started_tasks(bot: UrukBot, monkeypatch: pytest.MonkeyPatch, is_pr: bool, started: bool) -> None:

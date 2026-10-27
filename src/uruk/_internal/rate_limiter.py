@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from asyncio import Lock, sleep
+from collections import deque
 from datetime import timedelta
 from time import monotonic
 from typing import TYPE_CHECKING, Any
@@ -17,7 +18,10 @@ from telegram.ext import BaseRateLimiter
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
 
-_GROUP_INTERVAL = 3.1  # Stay below 20 messages per minute, including window boundaries.
+_GROUP_LIMIT = 20
+# Allow a prompt update and its next question together, while bounding both
+# short bursts and the group's rolling minute. Keep headroom at the boundaries.
+_REQUEST_WINDOWS = ((3, 1.1), (_GROUP_LIMIT, 60.1))
 _MAX_RETRIES = 3
 
 
@@ -31,7 +35,7 @@ class _TelegramRateLimiter(BaseRateLimiter[None]):
 
     def __init__(self) -> None:
         self._lock = Lock()
-        self._next_send = 0.0
+        self._requests: deque[float] = deque(maxlen=_GROUP_LIMIT)
         self._retry_at = 0.0
 
     async def initialize(self) -> None:
@@ -68,10 +72,18 @@ class _TelegramRateLimiter(BaseRateLimiter[None]):
         attempt = 0
         while True:
             # Recheck after sleeping: another request can extend the cooldown.
-            while (delay := max(self._retry_at, self._next_send if paced else 0.0) - monotonic()) > 0:  # noqa: ASYNC110
+            while True:
+                deadline = self._retry_at
+                if paced:
+                    for limit, period in _REQUEST_WINDOWS:
+                        if len(self._requests) >= limit:
+                            deadline = max(deadline, self._requests[-limit] + period)
+                delay = deadline - monotonic()
+                if delay <= 0:
+                    break
                 await sleep(delay)
             if paced:
-                self._next_send = monotonic() + _GROUP_INTERVAL
+                self._requests.append(monotonic())
             try:
                 return await callback(*args, **kwargs)
             except RetryAfter as error:

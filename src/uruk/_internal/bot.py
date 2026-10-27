@@ -141,6 +141,7 @@ class _Pending:
     multi: bool = False
     selected: set[int] = field(default_factory=set)
     payloads: list[object] = field(default_factory=list)
+    finalized: bool = False  # Whether an outcome edit has already removed the buttons.
 
 
 @dataclass(frozen=True)
@@ -344,7 +345,7 @@ class UrukBot:
                 pending.future.cancel()
             elif not pending.future.cancelled():
                 pending.future.exception()
-            if message is not None:
+            if message is not None and not pending.finalized:
                 with contextlib.suppress(TelegramError):
                     await message.edit_reply_markup(None)
 
@@ -731,10 +732,13 @@ class UrukBot:
             if arg != "skip" and arg not in _MODEL_COMMANDS:
                 await query.answer("Unknown model.")
                 return
-            del self.pending[pid]
-            pending.future.set_result(None if arg == "skip" else arg)
             await query.answer()
-            await self._finalize(query, "⏭ Skipped" if arg == "skip" else f"→ {arg}")
+            # Finish the outcome edit before waking the flow. Its cleanup can
+            # then avoid a duplicate button-removal request before the next item.
+            pending.finalized = await self._finalize(query, "⏭ Skipped" if arg == "skip" else f"→ {arg}")
+            self.pending.pop(pid, None)
+            if not pending.future.done():
+                pending.future.set_result(None if arg == "skip" else arg)
             return
 
     async def _handle_command_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -886,13 +890,16 @@ class UrukBot:
             elif not future.cancelled():
                 future.exception()
 
-    async def _finalize(self, query: Any, suffix: str) -> None:
-        """Append the outcome to the prompt message and drop its buttons."""
-        with contextlib.suppress(TelegramError, AttributeError):
+    async def _finalize(self, query: Any, suffix: str) -> bool:
+        """Append the outcome and remove buttons, returning whether the edit succeeded."""
+        try:
             await query.edit_message_text(
                 f"{query.message.text_html}\n\n{suffix}",
                 parse_mode=ParseMode.HTML,
             )
+        except (TelegramError, AttributeError):
+            return False
+        return True
 
     # -- messages ------------------------------------------------------------------
 

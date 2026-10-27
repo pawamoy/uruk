@@ -38,9 +38,10 @@ from claude_agent_sdk import (
 )
 from insiders import Issue
 from telegram import CallbackQuery, Chat, Message, MessageEntity, Update, User
-from telegram.error import BadRequest, TelegramError, TimedOut
+from telegram.error import BadRequest, TimedOut
 from telegram.ext import Application
 from telegramify_markdown.content import ContentTrace, Text
+from telegramify_markdown.entity import MessageEntity as RenderedEntity
 
 from uruk import ClaudeAgentTask, CodexAgentTask, Config, ConfigError, TaskInfo, UrukBot
 from uruk._internal import bot as bot_module
@@ -177,12 +178,7 @@ def test_run_bot_reexecutes_when_restart_was_requested(bot: UrukBot, monkeypatch
     restarted_bot = MagicMock(_restart_requested=True)
     app = MagicMock()
     builder = MagicMock()
-    builder.token.return_value = builder
-    builder.rate_limiter.return_value = builder
-    builder.read_timeout.return_value = builder
-    builder.write_timeout.return_value = builder
-    builder.connect_timeout.return_value = builder
-    builder.pool_timeout.return_value = builder
+    builder.bot.return_value = builder
     builder.post_init.return_value = builder
     builder.post_shutdown.return_value = builder
     builder.build.return_value = app
@@ -190,13 +186,15 @@ def test_run_bot_reexecutes_when_restart_was_requested(bot: UrukBot, monkeypatch
     monkeypatch.setattr(bot_module.Config, "from_env", lambda: bot.config)
     monkeypatch.setattr(bot_module, "UrukBot", lambda config: restarted_bot)
     monkeypatch.setattr(bot_module.Application, "builder", lambda: builder)
+    durable_bot = MagicMock()
+    monkeypatch.setattr(bot_module, "_DurableBot", durable_bot)
     monkeypatch.setattr(bot_module.os, "execv", execv)
 
     bot_module._run_bot()
 
     app.run_polling.assert_called_once_with(allowed_updates=["message", "callback_query"])
-    assert isinstance(builder.rate_limiter.call_args.args[0], bot_module._TelegramRateLimiter)
-    builder.read_timeout.assert_called_once_with(30)
+    builder.bot.assert_called_once_with(durable_bot.return_value)
+    assert isinstance(durable_bot.call_args.kwargs["rate_limiter"], bot_module._TelegramRateLimiter)
     execv.assert_called_once_with(bot_module.sys.executable, [bot_module.sys.executable, "-m", "uruk"])
 
 
@@ -435,10 +433,10 @@ def test_approvals_remain_pending_until_answered_or_cancelled(bot: UrukBot, canc
 @pytest.mark.parametrize("text_only", [False, True])
 def test_send_failure_does_not_leave_a_waiter(bot: UrukBot, text_only: bool) -> None:
     async def scenario() -> None:
-        bot._application().bot.send_message.side_effect = TelegramError("thread not found")
+        bot._application().bot.send_message.side_effect = BadRequest("thread not found")
 
         request = bot._request_dialogue_text(42, "Type an answer") if text_only else bot.ask_question(42, {"question": "Choose"})
-        with pytest.raises(RuntimeError, match="could not send"):
+        with pytest.raises(RuntimeError, match="retained"):
             await request
 
         assert not bot.pending
@@ -447,19 +445,20 @@ def test_send_failure_does_not_leave_a_waiter(bot: UrukBot, text_only: bool) -> 
     asyncio.run(scenario())
 
 
-def test_formatted_message_timeout_is_not_resent(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
-    # A timeout can occur after Telegram has already delivered the response.
+def test_formatted_message_timeout_is_retried_until_acknowledged(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Favor delivery after an ambiguous timeout, accepting the risk of a duplicate.
     box = Text(text="Answer", entities=[], content_trace=ContentTrace(source_type="text"))
     monkeypatch.setattr(bot_module, "telegramify", AsyncMock(return_value=[box]))
-    bot._application().bot.send_message.side_effect = TimedOut
+    bot._application().bot.send_message.side_effect = [TimedOut(), _message(bot, "Answer", 42)]
 
     asyncio.run(bot.send_text(42, "Answer"))
 
-    bot._application().bot.send_message.assert_awaited_once()
+    assert bot._application().bot.send_message.await_count == 2
+    assert not bot._outbox.pending()
 
 
 def test_rejected_formatting_falls_back_to_plain_text(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
-    box = Text(text="Answer", entities=[], content_trace=ContentTrace(source_type="text"))
+    box = Text(text="Answer", entities=[RenderedEntity(type="bold", offset=0, length=6)], content_trace=ContentTrace(source_type="text"))
     monkeypatch.setattr(bot_module, "telegramify", AsyncMock(return_value=[box]))
     bot._application().bot.send_message.side_effect = [BadRequest("can't parse entities"), _message(bot, "Answer", 42)]
 
@@ -467,6 +466,41 @@ def test_rejected_formatting_falls_back_to_plain_text(bot: UrukBot, monkeypatch:
 
     assert bot._application().bot.send_message.await_count == 2
     assert "entities" not in bot._application().bot.send_message.await_args.kwargs
+
+
+def test_stalled_formatting_delivers_the_saved_answer_as_plain_text(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def stalled_render(*_args: object, **_kwargs: object) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(bot_module, "telegramify", stalled_render)
+    monkeypatch.setattr(bot_module, "_RENDER_TIMEOUT", 0.01)
+
+    asyncio.run(bot.send_text(42, "The entire answer"))
+
+    assert bot._application().bot.send_message.await_args.kwargs["text"] == "The entire answer"
+    assert not bot._outbox.pending()
+
+
+def test_outbox_command_lists_and_recovers_blocked_answers(bot: UrukBot) -> None:
+    async def scenario() -> None:
+        bot._application().bot.send_message.side_effect = BadRequest("message thread not found")
+
+        with pytest.raises(RuntimeError, match="retained"):
+            await bot.send_text(42, "Recover this answer")
+
+        delivery_id = bot._outbox.pending()[0]["id"]
+        bot._application().bot.send_message.side_effect = None
+        await bot._cmd_outbox(_update(bot, "/outbox", 1), MagicMock(args=[]))
+
+        assert "blocked" in bot._application().bot.send_message.await_args.kwargs["text"]
+
+        await bot._cmd_outbox(_update(bot, f"/outbox resend {delivery_id}", 1), MagicMock(args=["resend", str(delivery_id)]))
+        await _wait_until(lambda: not bot._outbox.pending())
+
+        recovered = [call.kwargs for call in bot._application().bot.send_message.await_args_list if call.kwargs["text"] == "Recover this answer"]
+        assert recovered[-1]["message_thread_id"] is None
+
+    asyncio.run(scenario())
 
 
 def test_prompt_timeout_restores_the_command_panel(bot: UrukBot) -> None:
@@ -504,38 +538,37 @@ def test_auto_timeout_does_not_skip_the_unanswered_issue(bot: UrukBot, monkeypat
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("confirmation_fails", [False, True])
-def test_auto_skip_shows_the_next_issue_without_duplicate_edits(bot: UrukBot, monkeypatch: pytest.MonkeyPatch, confirmation_fails: bool) -> None:
+@pytest.mark.parametrize("choice", ["skip", "astra"])
+def test_auto_choices_show_the_next_issue_without_outcome_edits(bot: UrukBot, monkeypatch: pytest.MonkeyPatch, choice: str) -> None:
     async def scenario() -> None:
         issues: list[Issue] = [MagicMock(spec=Issue, repository="owner/project", number=number, title=f"Issue {number}", is_pr=False) for number in (1, 2)]
         bot.backlog = issues
         monkeypatch.setattr(bot, "_next_backlog_items", AsyncMock(return_value=issues))
         monkeypatch.setattr(bot, "_repo_for_backlog_issue", lambda issue: bot.config.data_dir)
-        if confirmation_fails:
-            bot._application().bot.edit_message_text.side_effect = TelegramError("edit failed")
+        monkeypatch.setattr(bot, "_start_session", AsyncMock(return_value=True))
 
         await bot._cmd_auto(_update(bot, "/auto", 1), MagicMock(args=[]))
         flow = bot.auto_runs[None]
         await _wait_until(lambda: bool(bot.pending))
         first_pid = next(iter(bot.pending))
 
-        await bot._on_button(_button(bot, f"a:{first_pid}:skip", 1), MagicMock())
-        await _wait_until(lambda: bool(bot.pending) and first_pid not in bot.pending)
+        await bot._on_button(_button(bot, f"a:{first_pid}:{choice}", 1), MagicMock())
+        await _wait_until(lambda: bool(bot.pending) and first_pid not in bot.pending and bot._application().bot.send_message.await_count >= 2)
 
         texts = [call.kwargs["text"] for call in bot._application().bot.send_message.await_args_list]
         assert "owner/project#2" in texts[-1]
-        assert bot.backlog_skipped == {"owner/project#1"}
-        bot._application().bot.edit_message_text.assert_awaited_once()
+        assert bot.backlog_skipped == ({"owner/project#1"} if choice == "skip" else set())
+        bot._application().bot.edit_message_text.assert_not_awaited()
 
-        # Only a failed confirmation needs a separate button-removal request.
-        assert bot._application().bot.edit_message_reply_markup.await_count == int(confirmation_fails)
+        # Remove used buttons without adding a Skipped or model label.
+        assert bot._application().bot.edit_message_reply_markup.await_count == 1
 
         second_pid = next(iter(bot.pending))
         await bot._on_button(_button(bot, f"a:{second_pid}:skip", 1), MagicMock())
         await flow
 
         assert not bot.pending
-        assert bot.backlog_skipped == {"owner/project#1", "owner/project#2"}
+        assert bot.backlog_skipped == ({"owner/project#1", "owner/project#2"} if choice == "skip" else {"owner/project#2"})
 
     asyncio.run(scenario())
 
@@ -829,10 +862,11 @@ def test_stalled_sdk_command_times_out_and_next_command_works(bot: UrukBot, monk
 
         await interrupt(_update(bot, "/interrupt"), MagicMock())
         await bot._bounded_handler(bot._cmd_help)(_update(bot, "/help"), MagicMock())
+        await _wait_until(lambda: bot._application().bot.send_message.await_count == 2)
 
         texts = [call.kwargs["text"] for call in bot._application().bot.send_message.await_args_list]
-        assert "timed out" in texts[0]
-        assert "/cancel" in texts[-1]
+        assert any("timed out" in text for text in texts)
+        assert any("/cancel" in text for text in texts)
 
     asyncio.run(scenario())
 

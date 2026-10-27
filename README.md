@@ -105,6 +105,7 @@ Worktrees remain available after you close their task topics.
 | `/interrupt` | a task topic | Interrupt the current agent turn. |
 | `/cancel` | anywhere | Cancel the current setup, question, approval, or handoff. The session stays available. |
 | `/restart` | General | Restart Uruk. You can wait for active agent turns or interrupt them. |
+| `/outbox [retry\|resend ID]` | anywhere | Inspect retained deliveries, retry blocked deliveries after correcting their errors, or recover one blocked message in the current topic. |
 | `/close` | a task topic | End the session and close the topic. |
 | `/purge` | anywhere | Delete all topics previously closed with `/close` (needs the *Delete messages* admin permission). |
 | `/model [name\|default]` | a task topic | Show or change the task's model within its current provider. Switching between Claude and Codex requires a new topic. |
@@ -117,6 +118,12 @@ with one button per option (plus **✍️ Other…** to answer with free text �
 topic is taken as the answer).
 
 Task topics show the agent's written progress updates and answers, questions, approvals, and errors. Routine command, file-edit, and tool-call notices stay in debug logs. A typing indicator shows when the agent is working.
+
+Uruk saves outgoing text, documents, and photos in `URUK_DATA_DIR/outbox.sqlite3` before sending them. The queue retries network failures with increasing delays of up to 60 seconds and honors Telegram flood-control cooldowns. Waiting sends survive handler cancellation and bot restarts. Whole agent answers are saved before formatting; delivery resumes from the first part without an acknowledgement.
+
+Delivery favors eventual arrival: a timeout or a crash after Telegram accepts a message can cause a duplicate. Permanent errors, such as a deleted topic or missing permissions, retain the original content and appear in `/outbox`. Correct the cause and use `/outbox retry`, or send `/outbox resend ID` in another topic to recover a blocked message there. Replayed questions retain their text but remove expired interaction buttons.
+
+In `/auto`, a choice removes the used buttons without adding a Skipped or model label. The next issue follows directly. Setup answer timeouts start after the question reaches Telegram.
 
 Prompt, Auto, and Attach run one at a time in General. Finish the current flow, or send `/cancel` before starting another.
 Each unanswered setup interaction expires after five minutes by default.

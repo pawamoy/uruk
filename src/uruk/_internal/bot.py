@@ -44,9 +44,17 @@ from insiders import GitHub, Issue, get_backlog
 from insiders import Unset as InsidersUnset
 from loguru import logger
 from openai_codex import AsyncCodex, CodexConfig
-from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity, Update
+from telegram import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    Message,
+    MessageEntity,
+    Update,
+)
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -55,12 +63,14 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 from telegramify_markdown import telegramify
-from telegramify_markdown.content import File, Photo, Text
+from telegramify_markdown.content import File, Text
 
 from uruk._internal.agent import AgentTask, ClaudeAgentTask, _InteractionCancelledError, _summarize_tool_input
 from uruk._internal.codex_agent import CodexAgentTask
 from uruk._internal.config import Config, ConfigError
+from uruk._internal.outbox import _DurableBot, _Outbox
 from uruk._internal.rate_limiter import _TelegramRateLimiter
 from uruk._internal.store import SessionStore, TaskInfo
 from uruk._internal.worktrees import _prepare_worktree
@@ -87,6 +97,7 @@ _AUTO_DEFAULT_LIMIT = 5
 _AUTO_MAX_LIMIT = 20
 _DISCOVERY_TIMEOUT = 120
 _UPDATE_TIMEOUT = 30
+_RENDER_TIMEOUT = 30
 
 
 def _parse_effort_flag(argument: str) -> str | None:
@@ -141,7 +152,6 @@ class _Pending:
     multi: bool = False
     selected: set[int] = field(default_factory=set)
     payloads: list[object] = field(default_factory=list)
-    finalized: bool = False  # Whether an outcome edit has already removed the buttons.
 
 
 @dataclass(frozen=True)
@@ -196,6 +206,7 @@ class UrukBot:
         self._pid = itertools.count(secrets.randbits(48))
         self.app: Application | None = None
         """Attached Telegram application, or `None` before attachment."""
+        self._outbox = _Outbox(config.data_dir / "outbox.sqlite3", self._deliver_message, self._prepare_text)
 
     # -- wiring ------------------------------------------------------------------
 
@@ -216,6 +227,7 @@ class UrukBot:
             ("close", self._cmd_close),
             ("purge", self._cmd_purge),
             ("auto", self._cmd_auto),
+            ("outbox", self._cmd_outbox),
             ("model", self._cmd_model),
             ("effort", self._cmd_effort),
             (tuple(_MODEL_COMMANDS), self._cmd_new_model),
@@ -238,11 +250,11 @@ class UrukBot:
             except TimeoutError:
                 logger.warning("Telegram handler timed out")
                 if self._auth(update):
-                    await self._send(self._message(update).message_thread_id, "⌛ That action timed out. You can retry it, or use /cancel to stop a waiting flow.")
+                    self._queue_notice(self._message(update).message_thread_id, "⌛ That action timed out. You can retry it, or use /cancel to stop a waiting flow.")
             except Exception:  # noqa: BLE001
                 logger.exception("Telegram handler failed")
                 if self._auth(update):
-                    await self._send(self._message(update).message_thread_id, "⚠️ That action failed. You can retry it; see the bot logs for details.")
+                    self._queue_notice(self._message(update).message_thread_id, "⚠️ That action failed. You can retry it; see the bot logs for details.")
 
         return handle
 
@@ -266,6 +278,7 @@ class UrukBot:
             self._cancel_interactions(topic_id)
         for task in list(self.tasks.values()):
             await task.close()
+        await self._outbox.stop()
         if self.control_server is not None:
             self.control_server.close()
             await self.control_server.wait_closed()
@@ -332,10 +345,12 @@ class UrukBot:
         self.pending[pid] = pending
         message = None
         try:
+            # The user's answer timeout starts after delivery, so an outage
+            # cannot consume the time available to answer a setup question.
+            message = await self._send(pending.topic_id, text, **kwargs)
+            if message is None:
+                raise RuntimeError("could not send the interaction to Telegram")
             async with asyncio.timeout(expires_after):
-                message = await self._send(pending.topic_id, text, **kwargs)
-                if message is None:
-                    raise RuntimeError("could not send the interaction to Telegram")
                 return await pending.future
         finally:
             self.pending.pop(pid, None)
@@ -345,7 +360,7 @@ class UrukBot:
                 pending.future.cancel()
             elif not pending.future.cancelled():
                 pending.future.exception()
-            if message is not None and not pending.finalized:
+            if message is not None:
                 with contextlib.suppress(TelegramError):
                     await message.edit_reply_markup(None)
 
@@ -359,6 +374,7 @@ class UrukBot:
 
     async def startup(self, app: Application) -> None:
         """Start local services and report a completed remote restart."""
+        self._outbox.start()
         await self.start_control_server(app)
         marker = self._restart_marker_path()
         if marker.exists() and await self._send(None, "✅ Uruk restarted successfully.") is not None:
@@ -507,51 +523,35 @@ class UrukBot:
     # -- UI protocol (called from AgentTask) --------------------------------------
 
     async def send_text(self, topic_id: int, text: str) -> None:
-        """Send an agent response with Telegram formatting and file attachments."""
-        try:
-            boxes = await telegramify(text, max_message_length=_MESSAGE_LIMIT, min_file_lines=_MIN_FILE_LINES)
-        except Exception:  # noqa: BLE001
-            logger.opt(exception=True).warning("telegramify failed for topic {}, sending plain text", topic_id)
-            for part in _chunk(text):
-                await self._send(topic_id, part)
-            return
-        for box in boxes:
-            try:
-                await self._send_box(topic_id, box)
-            except BadRequest as error:
-                logger.warning("sending {} to topic {} failed: {}", type(box).__name__, topic_id, error)
-                if isinstance(box, Text):
-                    await self._send(topic_id, box.text)
-            except TelegramError as error:
-                # A timeout can follow successful delivery. Resending plain text
-                # here would risk sending the same response twice.
-                logger.warning("sending {} to topic {} failed: {}", type(box).__name__, topic_id, error)
+        """Persist a complete agent response before formatting or delivering any part."""
+        await self._outbox.send("renderText", {"chat_id": self.config.chat_id, "message_thread_id": topic_id, "text": text})
 
-    async def _send_box(self, topic_id: int, box: Text | File | Photo) -> None:
-        if isinstance(box, Text):
-            await self._application().bot.send_message(
-                chat_id=self.config.chat_id,
-                text=box.text,
-                entities=_to_entities(box.entities),
-                message_thread_id=topic_id,
-            )
-        elif isinstance(box, File):
-            await self._application().bot.send_document(
-                chat_id=self.config.chat_id,
-                document=box.file_data,
-                filename=box.file_name,
-                caption=box.caption_text or None,
-                caption_entities=_to_entities(box.caption_entities),
-                message_thread_id=topic_id,
-            )
-        else:  # Photo (e.g. rendered mermaid diagrams)
-            await self._application().bot.send_photo(
-                chat_id=self.config.chat_id,
-                photo=box.file_data,
-                caption=box.caption_text or None,
-                caption_entities=_to_entities(box.caption_entities),
-                message_thread_id=topic_id,
-            )
+    async def _deliver_message(self, operation: str, data: dict) -> Any:
+        bot = self._application().bot
+        if isinstance(bot, _DurableBot):
+            return await bot.deliver(operation, data)
+        methods = {"sendMessage": "send_message", "sendDocument": "send_document", "sendPhoto": "send_photo", "editMessageReplyMarkup": "edit_message_reply_markup"}
+        return await getattr(bot, methods[operation])(**data)
+
+    async def _prepare_text(self, data: dict) -> list[tuple[str, dict]]:
+        """Render a saved response into parts that can each resume after a restart."""
+        text = data["text"]
+        destination = {key: value for key, value in data.items() if key != "text"}
+        try:
+            # A stalled diagram renderer must not hold every topic's outbox.
+            async with asyncio.timeout(_RENDER_TIMEOUT):
+                boxes = await telegramify(text, max_message_length=_MESSAGE_LIMIT, min_file_lines=_MIN_FILE_LINES)
+        except Exception:  # noqa: BLE001
+            logger.opt(exception=True).warning("telegramify failed for topic {}, sending plain text", data.get("message_thread_id"))
+            return [("sendMessage", {**destination, "text": part}) for part in _chunk(text)]
+        parts = []
+        for box in boxes:
+            if isinstance(box, Text):
+                parts.append(("sendMessage", {**destination, "text": box.text, "entities": _to_entities(box.entities)}))
+            else:
+                operation, field_name = ("sendDocument", "document") if isinstance(box, File) else ("sendPhoto", "photo")
+                parts.append((operation, {**destination, field_name: InputFile(box.file_data, filename=box.file_name), "caption": box.caption_text or None, "caption_entities": _to_entities(box.caption_entities)}))
+        return parts or [("sendMessage", {**destination, "text": part}) for part in _chunk(text)]
 
     async def send_activity(self, topic_id: int, text: str) -> None:
         """Send an activity notice in italics to a topic."""
@@ -618,16 +618,12 @@ class UrukBot:
         return InlineKeyboardMarkup(rows)
 
     async def _send(self, topic_id: int | None, text: str, **kwargs: Any) -> Message | None:
-        try:
-            return await self._application().bot.send_message(
-                chat_id=self.config.chat_id,
-                text=text,
-                message_thread_id=self._topic_key(topic_id),
-                **kwargs,
-            )
-        except TelegramError as error:
-            logger.warning("failed to send message to topic {}: {}", topic_id, error)
-            return None
+        result = await self._outbox.send("sendMessage", {"chat_id": self.config.chat_id, "text": text, "message_thread_id": self._topic_key(topic_id), **kwargs})
+        return result if isinstance(result, Message) else Message.de_json(result, self._application().bot)
+
+    def _queue_notice(self, topic_id: int | None, text: str) -> None:
+        """Persist handler failure feedback without holding the update dispatcher."""
+        self._outbox.enqueue("sendMessage", {"chat_id": self.config.chat_id, "message_thread_id": self._topic_key(topic_id), "text": text})
 
     # -- button presses ------------------------------------------------------------
 
@@ -733,9 +729,6 @@ class UrukBot:
                 await query.answer("Unknown model.")
                 return
             await query.answer()
-            # Finish the outcome edit before waking the flow. Its cleanup can
-            # then avoid a duplicate button-removal request before the next item.
-            pending.finalized = await self._finalize(query, "⏭ Skipped" if arg == "skip" else f"→ {arg}")
             self.pending.pop(pid, None)
             if not pending.future.done():
                 pending.future.set_result(None if arg == "skip" else arg)
@@ -878,9 +871,9 @@ class UrukBot:
         future = asyncio.get_running_loop().create_future()
         self.awaiting_text[topic_id] = future
         try:
+            if await self._send(topic_id, text) is None:
+                raise RuntimeError("could not send the text prompt to Telegram")
             async with asyncio.timeout(self.config.interaction_timeout):
-                if await self._send(topic_id, text) is None:
-                    raise RuntimeError("could not send the text prompt to Telegram")
                 return await future
         finally:
             if self.awaiting_text.get(topic_id) is future:
@@ -890,16 +883,13 @@ class UrukBot:
             elif not future.cancelled():
                 future.exception()
 
-    async def _finalize(self, query: Any, suffix: str) -> bool:
-        """Append the outcome and remove buttons, returning whether the edit succeeded."""
-        try:
+    async def _finalize(self, query: Any, suffix: str) -> None:
+        """Append the outcome to the prompt message and remove its buttons."""
+        with contextlib.suppress(TelegramError, AttributeError):
             await query.edit_message_text(
                 f"{query.message.text_html}\n\n{suffix}",
                 parse_mode=ParseMode.HTML,
             )
-        except (TelegramError, AttributeError):
-            return False
-        return True
 
     # -- messages ------------------------------------------------------------------
 
@@ -1024,12 +1014,39 @@ class UrukBot:
             "/interrupt — interrupt the current turn (in a task topic)\n"
             "/cancel — cancel the current setup, question, approval, or handoff\n"
             "/restart — restart Uruk from the General topic\n"
+            "/outbox [retry|resend ID] — inspect, retry, or recover retained messages here\n"
             "/close — end the session and close the topic (in a task topic)\n"
             "/purge — delete topics closed with /close, and forget sessions whose topics were deleted by hand\n"
             "/model [name|default] — show or change this task's model (in a task topic)\n"
             "/effort [low|medium|high|xhigh|max|default] — show or change this task's effort (in a task topic)\n"
             "Any text inside a Telegram-owned task topic goes to that session.",
         )
+
+    async def _cmd_outbox(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show retained deliveries and retry failures after their cause is corrected."""
+        if not self._auth(update):
+            return
+        args = context.args or []
+        topic_id = self._message(update).message_thread_id
+        if len(args) == 2 and args[0] == "resend" and args[1].isascii() and args[1].isdecimal():  # noqa: PLR2004
+            recovered = self._outbox.resend(int(args[1]), self._message(update).chat_id, topic_id)
+            await self._send(topic_id, f"Delivery #{args[1]} queued for this topic." if recovered else "No blocked message with that ID was found.")
+            return
+        if args not in ([], ["retry"]):
+            await self._send(topic_id, "Usage: /outbox [retry|resend ID]")
+            return
+        retried = self._outbox.retry() if args else 0
+        deliveries = self._outbox.pending()
+        lines = [f"Outbox: {len(deliveries)} retained deliveries."]
+        if retried:
+            lines.append(f"Retrying {retried} blocked deliveries.")
+        for delivery in deliveries[:10]:
+            lines.append(f"#{delivery['id']} · {delivery['state']} · {delivery['operation']} · {delivery['topic']} · attempts: {delivery['attempts']}")
+            if delivery["last_error"]:
+                lines.append(delivery["last_error"][:200])
+        if any(delivery["state"] == "blocked" for delivery in deliveries):
+            lines.append("Correct the error and use /outbox retry, or use /outbox resend ID to recover a message in this topic. Content stays on disk.")
+        await self._send(self._message(update).message_thread_id, "\n".join(lines))
 
     async def _cmd_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Offer configured GitHub backlog items as one-click model tasks."""
@@ -1922,12 +1939,7 @@ def _run_bot() -> None:
     bot = UrukBot(config)
     app = (
         Application.builder()
-        .token(config.token)
-        .rate_limiter(_TelegramRateLimiter())
-        .read_timeout(30)
-        .write_timeout(30)
-        .connect_timeout(10)
-        .pool_timeout(10)
+        .bot(_DurableBot(token=config.token, outbox=bot._outbox, rate_limiter=_TelegramRateLimiter(), request=HTTPXRequest(read_timeout=30, write_timeout=30, connect_timeout=10, pool_timeout=10)))
         .post_init(bot.startup)
         .post_shutdown(bot.shutdown)
         .build()

@@ -29,6 +29,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+from insiders import Issue
 from telegram import CallbackQuery, Chat, Message, MessageEntity, Update, User
 from telegram.error import TelegramError
 from telegram.ext import Application
@@ -459,6 +460,87 @@ def test_auto_timeout_does_not_skip_the_unanswered_issue(bot: UrukBot, monkeypat
         assert not bot.backlog_started
         assert not bot.pending
         assert not bot.auto_runs
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("is_pr", [False, True])
+@pytest.mark.parametrize("started", [False, True])
+def test_auto_tracks_only_started_tasks(bot: UrukBot, monkeypatch: pytest.MonkeyPatch, is_pr: bool, started: bool) -> None:
+    async def scenario() -> None:
+        issue = MagicMock(spec=Issue, repository="owner/project", number=7, title="Fix", is_pr=is_pr)
+        bot.backlog = [issue]
+        start = AsyncMock(return_value=started)
+        monkeypatch.setattr(bot, "_repo_for_backlog_issue", lambda issue: bot.config.data_dir)
+        monkeypatch.setattr(bot, "_ask_auto_model", AsyncMock(return_value="astra"))
+        monkeypatch.setattr(bot, "_start_session", start)
+
+        await bot._run_auto(_message(bot, "/auto", 1), None, 1)
+
+        assert start.await_args is not None
+        assert start.await_args.kwargs["issue_number"] == (None if is_pr else 7)
+        assert bot.backlog_started == ({"owner/project#7"} if started else set())
+        assert not bot.backlog_skipped
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider", ["claude", "openai"])
+def test_new_task_uses_and_persists_its_worktree(bot: UrukBot, monkeypatch: pytest.MonkeyPatch, provider: str) -> None:
+    async def scenario() -> None:
+        worktree = bot.config.data_dir / "project#7"
+        worktree.mkdir()
+        prepare = MagicMock(return_value=worktree)
+        task = MagicMock(submit=AsyncMock())
+        monkeypatch.setattr(bot_module, "_prepare_worktree", prepare)
+        monkeypatch.setattr(bot, "_make_task", lambda info: task)
+        monkeypatch.setattr(bot, "_pin_status", AsyncMock())
+        bot._application().bot.create_forum_topic.return_value = SimpleNamespace(message_thread_id=42)
+        prompt = "Fix https://github.com/owner/project/issues/7"
+
+        started = await bot._start_session(_message(bot, "start", 1), provider, "model", None, str(bot.config.data_dir), prompt)
+
+        assert started
+        prepare.assert_called_once_with(bot.config.data_dir, 7)
+        info = bot.store.get(42)
+        restored = bot_module.SessionStore(bot.store.path).get(42)
+        assert info is not None
+        assert restored is not None
+        assert info.repo == restored.repo == str(worktree)
+        task.submit.assert_awaited_once_with(prompt)
+
+    asyncio.run(scenario())
+
+
+def test_worktree_failure_does_not_create_a_topic_or_agent(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        prepare = MagicMock(side_effect=RuntimeError("branch already in use"))
+        monkeypatch.setattr(bot_module, "_prepare_worktree", prepare)
+
+        started = await bot._start_session(_message(bot, "start", 1), "claude", "opus", None, str(bot.config.data_dir), "Fix the bug")
+
+        assert not started
+        bot._application().bot.create_forum_topic.assert_not_awaited()
+        assert not bot.store.all()
+        assert not bot.tasks
+        assert "branch already in use" in bot._application().bot.send_message.await_args.kwargs["text"]
+
+    asyncio.run(scenario())
+
+
+def test_existing_task_prevents_a_second_agent_in_its_worktree(bot: UrukBot, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        worktree = bot.config.data_dir / "project#7"
+        worktree.mkdir()
+        bot.store.set(TaskInfo(topic_id=42, repo=str(worktree), title="Existing work"))
+        monkeypatch.setattr(bot_module, "_prepare_worktree", MagicMock(return_value=worktree))
+
+        started = await bot._start_session(_message(bot, "start", 1), "claude", "opus", None, str(bot.config.data_dir), "Fix the bug", issue_number=7)
+
+        assert not started
+        bot._application().bot.create_forum_topic.assert_not_awaited()
+        assert len(bot.store.all()) == 1
+        assert "existing topic" in bot._application().bot.send_message.await_args.kwargs["text"]
 
     asyncio.run(scenario())
 

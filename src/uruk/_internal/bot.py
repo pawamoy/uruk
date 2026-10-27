@@ -28,6 +28,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -61,6 +62,7 @@ from uruk._internal.agent import AgentTask, ClaudeAgentTask, _InteractionCancell
 from uruk._internal.codex_agent import CodexAgentTask
 from uruk._internal.config import Config, ConfigError
 from uruk._internal.store import SessionStore, TaskInfo
+from uruk._internal.worktrees import _prepare_worktree
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine, Iterator
@@ -1072,7 +1074,6 @@ class UrukBot:
             if model_command is None:
                 self.backlog_skipped.add(key)
                 continue
-            self.backlog_started.add(key)
             provider, model = _MODEL_COMMANDS[model_command]
             issue_kind = "pull request" if issue.is_pr else "issue"
             url_part = "pull" if issue.is_pr else "issues"
@@ -1080,7 +1081,8 @@ class UrukBot:
                 f"Work on GitHub {issue_kind} {issue.repository}#{issue.number}: {issue.title}\n"
                 f"https://github.com/{issue.repository}/{url_part}/{issue.number}"
             )
-            await self._start_session(message, provider, model, None, str(repo), prompt)
+            if await self._start_session(message, provider, model, None, str(repo), prompt, issue_number=None if issue.is_pr else issue.number):
+                self.backlog_started.add(key)
         reviewed = self.backlog_started | self.backlog_skipped
         if all(self._issue_key(issue) in reviewed for issue in self.backlog):
             await self._send(
@@ -1250,13 +1252,25 @@ class UrukBot:
         effort: str | None,
         repo_argument: str,
         prompt: str,
-    ) -> None:
-        """Create a task topic from either a slash command or the prompt dialogue."""
+        *,
+        issue_number: int | None = None,
+    ) -> bool:
+        """Create a worktree and task topic, returning whether the task started."""
         repo = self._resolve_repo(repo_argument)
         if repo is None:
             hint = " Use /repos to list them." if self.config.repos_root else ""
             await message.reply_text(f"Not a directory: {repo_argument}.{hint}")
-            return
+            return False
+        if issue_number is None and (match := re.search(r"https://github\.com/[^/\s]+/[^/\s]+/issues/([1-9]\d*)\b", prompt)):
+            issue_number = int(match[1])
+        try:
+            repo = await asyncio.to_thread(_prepare_worktree, repo, issue_number)
+        except (RuntimeError, OSError) as error:
+            await message.reply_text(f"Could not prepare a worktree: {error}")
+            return False
+        if any(Path(info.repo) == repo for info in self.store.all()):
+            await message.reply_text(f"A task already uses {repo}. Continue in its existing topic.")
+            return False
         title = prompt[:60] if prompt else "interactive session"
         info = TaskInfo(
             topic_id=0,
@@ -1276,7 +1290,7 @@ class UrukBot:
                 f"Could not create a topic ({error}). Is the group a forum, and is the bot "
                 "an admin with the 'Manage topics' permission?",
             )
-            return
+            return False
         info.topic_id = topic.message_thread_id
         self.store.set(info)
         task = self._make_task(info)
@@ -1288,6 +1302,7 @@ class UrukBot:
         else:
             await self._send(info.topic_id, "Say what you need.")
         await message.reply_text(f"Started: {repo.name} · {title}")
+        return True
 
     def _resolve_repo(self, arg: str) -> Path | None:
         path = Path(arg).expanduser()

@@ -88,6 +88,12 @@ button starts a guided flow to choose the model, reasoning effort, repository
 `insiders` configuration, then obtains a GitHub token from `gh auth token` at
 runtime. Authenticate the GitHub CLI on the machine running Uruk first.
 
+Every new task runs in a Git worktree under `~/dev/.worktrees`, with its own branch created from the repository's current `HEAD`.
+Issue tasks from `/auto`, or prompts containing a GitHub issue URL, use worktree `REPO#N` and branch `issueN`.
+Other tasks use worktree `REPO-task-ID` and branch `task-ID`, with a unique ID.
+Uruk reuses an existing issue worktree or branch without resetting its changes. If a tracked task already uses that worktree, continue in its existing topic.
+Worktrees remain available after you close their task topics.
+
 | Command | Where | Effect |
 |---|---|---|
 | `/<model> [--<effort>] <repo> [task…]` | General | Start a Claude session with `fable`, `opus`, `sonnet`, or `haiku`, or a Codex session with `astra`, `sol`, `terra`, or `luna`, in `<repo>` (absolute path, or relative to `URUK_REPOS_ROOT`). Effort is optionally `--low`, `--medium`, `--high`, `--xhigh`, or `--max`; the rest of the line is the first prompt. Examples: `/fable --max myrepo Fix the tests`, `/astra --high myrepo Review this diff`. |
